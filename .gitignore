@@ -1,0 +1,14 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+
+# Downloaded at setup time, never commit binaries or model weights
+app/src/main/cpp/llama.cpp/
+app/src/proot/assets/rootfs/*.tar.gz
+app/src/proot/jniLibs/**/*.so
+.cxx/
+*.gguf
+*.gguf.part

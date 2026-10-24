@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Local AI Agent</string>
+    <string name="notification_channel_runtime">Local AI runtime</string>
+    <string name="notification_runtime_title">Local AI runtime active</string>
+    <string name="notification_runtime_text">Keeping the model and container alive</string>
+</resources>
