@@ -17,3 +17,8 @@ app/src/proot/jniLibs/**/*.so
 keystore.properties
 *.jks
 *.keystore
+
+# JVM crash artefacts
+hs_err_pid*.log
+core.*
+*.hprof

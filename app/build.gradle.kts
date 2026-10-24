@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -13,7 +15,7 @@ val llamaNativeJobs = providers.gradleProperty("localaiNativeJobs").orNull?.toIn
 
 // Release signing material lives outside the repository. Override the location with
 // -PkeystoreProperties=/path/to/keystore.properties (see README, "Release builds").
-val releaseKeystoreProperties = java.util.Properties().apply {
+val releaseKeystoreProperties = Properties().apply {
     val override = providers.gradleProperty("keystoreProperties").orNull
     val candidate = if (override != null) {
         file(override)
