@@ -112,6 +112,18 @@ GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx2560m -XX:TieredStopAtLevel=1" \
   ./gradlew --no-daemon --no-parallel assembleProotDebug
 ```
 
+The same class of host can also make `clang++` crash with exit code 139 in the LLVM
+register allocator while ninja compiles several large llama.cpp translation units at
+once. The file that crashes changes between runs, and compiling it alone succeeds, so
+this is a resource/concurrency failure rather than a code error. Limit native compile
+parallelism with ninja job pools:
+
+```bash
+./gradlew assembleProotDebug -PlocalaiNativeJobs=2   # or =1 on a 4-core/8 GB box
+```
+
+The default (flag omitted) leaves ninja free to use every core.
+
 Verified with AGP 8.7.3, Gradle 8.9, JDK 17, NDK 27.0.12077973, CMake 3.22.1 and SDK 35:
 both flavors compile, 40 JVM tests pass, and `liblocalai.so` is linked with 16 KB `LOAD`
 alignment (required by Android 15+ devices with 16 KB pages). The APK's native libraries are
