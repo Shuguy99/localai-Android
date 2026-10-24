@@ -149,6 +149,32 @@ ARMv8.2 dot-product extension, which is substantially faster for 4-bit quants:
 Do not ship that build to ARMv8.0 devices (it will crash with `SIGILL`). Use it when you know
 the target hardware, or keep the portable default.
 
+### Release builds
+
+Signing material is never committed. The build reads
+`~/.localai-release/keystore.properties` by default, or the file passed with
+`-PkeystoreProperties=/path/to/keystore.properties`:
+
+```properties
+storeFile=/home/me/.localai-release/localai-release.jks
+storePassword=...
+keyAlias=localai
+keyPassword=...
+```
+
+Create the key once, then build:
+
+```bash
+mkdir -p ~/.localai-release && chmod 700 ~/.localai-release
+keytool -genkeypair -keystore ~/.localai-release/localai-release.jks -alias localai \
+  -keyalg RSA -keysize 4096 -validity 10000
+
+./gradlew assembleProotRelease assembleStandardRelease
+```
+
+Without that file the release variants build but stay unsigned. Keep the keystore and
+its passwords backed up: Android only accepts updates signed with the same key.
+
 
 ## First run
 

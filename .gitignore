@@ -12,3 +12,8 @@ app/src/proot/jniLibs/**/*.so
 .cxx/
 *.gguf
 *.gguf.part
+
+# Release signing material must never be committed
+keystore.properties
+*.jks
+*.keystore

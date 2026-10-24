@@ -11,6 +11,19 @@ val llamaArmArch = providers.gradleProperty("llamaArmArch").orNull?.takeIf { it.
 // low-RAM host. Without it ninja uses every core and heavy clang TUs can OOM/crash.
 val llamaNativeJobs = providers.gradleProperty("localaiNativeJobs").orNull?.toIntOrNull()?.takeIf { it > 0 }
 
+// Release signing material lives outside the repository. Override the location with
+// -PkeystoreProperties=/path/to/keystore.properties (see README, "Release builds").
+val releaseKeystoreProperties = java.util.Properties().apply {
+    val override = providers.gradleProperty("keystoreProperties").orNull
+    val candidate = if (override != null) {
+        file(override)
+    } else {
+        file(System.getProperty("user.home") + "/.localai-release/keystore.properties")
+    }
+    if (candidate.isFile) candidate.inputStream().use { load(it) }
+}
+val hasReleaseSigning = releaseKeystoreProperties.getProperty("storeFile") != null
+
 android {
     namespace = "dev.localai.agent"
     compileSdk = 35
@@ -119,6 +132,17 @@ android {
         jvmTarget = "17"
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystoreProperties.getProperty("storeFile"))
+                storePassword = releaseKeystoreProperties.getProperty("storePassword")
+                keyAlias = releaseKeystoreProperties.getProperty("keyAlias")
+                keyPassword = releaseKeystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -126,6 +150,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            // Without signing material the release APK stays unsigned instead of
+            // silently falling back to the debug key.
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
     }
 }
