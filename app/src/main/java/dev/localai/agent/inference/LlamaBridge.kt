@@ -71,6 +71,14 @@ object LlamaBridge {
     @JvmStatic
     external fun cancel(handle: Long)
 
+    /**
+     * Drops the native KV prefix cache so the next request re-decodes from
+     * scratch. Call when the conversation is reset; harmless when no context
+     * has been created yet.
+     */
+    @JvmStatic
+    external fun resetContext(handle: Long)
+
     @JvmStatic
     external fun tokenCount(handle: Long, text: String): Int
 

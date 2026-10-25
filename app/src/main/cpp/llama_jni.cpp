@@ -2,9 +2,20 @@
 //
 // Design notes:
 //  * Weights are loaded once per model (mmap) and kept in a Session.
-//  * A fresh llama_context is created for every generation. This costs a few
-//    hundred ms but keeps KV-cache lifetime, cancellation and memory accounting
-//    trivial. Prefix caching / persistent contexts are a later optimisation.
+//  * The llama_context is persistent and shared by all generations of a session.
+//    A token-level prefix cache remembers which tokens already live in the KV
+//    cache; on the next generate() the longest common prefix with the new prompt
+//    is reused and only the tail is decoded. In the agent loop every step shares
+//    the system prompt + conversation history, so step N typically re-decodes a
+//    few hundred tokens instead of the whole multi-thousand-token prompt.
+//  * Fallbacks keep the cache honest: if the KV cannot be trimmed (SWA-style
+//    memories may refuse a partial removal) or a decode fails, the cache is
+//    cleared and the next request re-decodes from scratch — correctness first.
+//  * When the new prompt is fully covered by the cache, the last prompt token is
+//    re-decoded so the logits buffer is guaranteed to match the prompt tail.
+//  * Sessions are owned by a shared_ptr registry: freeModel() drops the registry
+//    reference, an in-flight generate() keeps the Session alive until it returns.
+//    No intentional leaks, no use-after-free.
 //  * All state is guarded by a per-session mutex; cancel() only flips an atomic.
 //  * Text crosses the JNI boundary as real UTF-8, not Modified UTF-8, so emoji
 //    and other supplementary-plane code points survive.
@@ -19,10 +30,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include "llama.h"
@@ -34,24 +46,36 @@
 
 namespace {
 
+// How many trailing tokens are fed to the penalties sampler when a generation
+// starts (mirrors the upstream server, which seeds its "prev" ring from the
+// prompt tail so repeat penalties survive across cached prefixes).
+constexpr int32_t kPenaltyWindow = 64;
+
 struct Session {
     llama_model * model = nullptr;
     const llama_vocab * vocab = nullptr;
     int n_ctx = 2048;
     int n_batch = 512;
     int n_threads = 4;
+
+    // Persistent context and the tokens currently resident in its KV cache for
+    // sequence 0. Both are guarded by `mu`; `cached.size()` is always the number
+    // of decoded positions (0-based, contiguous) in the cache, and the logits
+    // buffer always corresponds to the last cached token after generate() runs.
+    llama_context * ctx = nullptr;
+    std::vector<llama_token> cached;
+
     std::atomic<bool> cancel{false};
     std::mutex mu;
 };
 
 std::mutex g_registry_mu;
-std::unordered_set<Session *> g_sessions;
+std::unordered_map<Session *, std::shared_ptr<Session>> g_sessions;
 
-Session * lookup(jlong handle) {
-    auto * s = reinterpret_cast<Session *>(handle);
+std::shared_ptr<Session> lookup(jlong handle) {
     std::lock_guard<std::mutex> lock(g_registry_mu);
-    if (g_sessions.find(s) == g_sessions.end()) return nullptr;
-    return s;
+    const auto it = g_sessions.find(reinterpret_cast<Session *>(handle));
+    return it != g_sessions.end() ? it->second : nullptr;
 }
 
 void append_utf8(std::string & out, uint32_t cp) {
@@ -223,7 +247,7 @@ llama_sampler * build_sampler(
     const int n_vocab = static_cast<int>(llama_vocab_n_tokens(vocab));
     llama_sampler_chain_add(
             chain,
-            llama_sampler_init_penalties(n_vocab, 64, repeat_penalty, 0.0f, 0.0f));
+            llama_sampler_init_penalties(n_vocab, kPenaltyWindow, repeat_penalty, 0.0f, 0.0f));
 
     if (top_k > 0) {
         llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
@@ -252,6 +276,46 @@ void android_log_callback(ggml_log_level level, const char * text, void * /*user
         case GGML_LOG_LEVEL_WARN:  LOGW("%s", text); break;
         default: break; // keep INFO/DEBUG out of logcat to avoid I/O stalls
     }
+}
+
+// Frees the persistent context and invalidates the token cache. Caller holds mu.
+void destroy_context(Session * s) {
+    if (s->ctx != nullptr) {
+        llama_free(s->ctx);
+        s->ctx = nullptr;
+    }
+    s->cached.clear();
+}
+
+// Creates the persistent context lazily on first use so loadModel stays fast.
+// Caller holds mu.
+bool ensure_context(Session * s) {
+    if (s->ctx != nullptr) return true;
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = static_cast<uint32_t>(s->n_ctx);
+    cparams.n_batch = static_cast<uint32_t>(s->n_batch);
+    cparams.n_ubatch = static_cast<uint32_t>(s->n_batch);
+    cparams.n_threads = s->n_threads;
+    cparams.n_threads_batch = s->n_threads;
+    cparams.no_perf = true;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    s->ctx = llama_init_from_model(s->model, cparams);
+    if (s->ctx == nullptr) {
+        LOGE("llama_init_from_model failed (n_ctx=%d)", s->n_ctx);
+        return false;
+    }
+    s->cached.clear();
+    return true;
+}
+
+// Length of the longest common prefix of the cached KV tokens and the new prompt.
+size_t common_prefix_len(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
+    const size_t max = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < max && a[i] == b[i]) ++i;
+    return i;
 }
 
 } // namespace
@@ -306,7 +370,7 @@ Java_dev_localai_agent_inference_LlamaBridge_loadModel(
         return 0;
     }
 
-    auto * session = new Session();
+    auto session = std::make_shared<Session>();
     session->model = model;
     session->vocab = vocab;
     session->n_ctx = n_ctx > 0 ? n_ctx : 2048;
@@ -315,34 +379,50 @@ Java_dev_localai_agent_inference_LlamaBridge_loadModel(
 
     {
         std::lock_guard<std::mutex> lock(g_registry_mu);
-        g_sessions.insert(session);
+        g_sessions.emplace(session.get(), session);
     }
-    return reinterpret_cast<jlong>(session);
+    return reinterpret_cast<jlong>(session.get());
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_localai_agent_inference_LlamaBridge_freeModel(JNIEnv *, jclass, jlong handle) {
-    auto * session = reinterpret_cast<Session *>(handle);
+    std::shared_ptr<Session> session;
     {
         std::lock_guard<std::mutex> lock(g_registry_mu);
-        if (g_sessions.erase(session) == 0) return;
+        const auto it = g_sessions.find(reinterpret_cast<Session *>(handle));
+        if (it == g_sessions.end()) return;
+        session = it->second;
+        g_sessions.erase(it);
     }
-    {
-        std::lock_guard<std::mutex> lock(session->mu);
-        if (session->model != nullptr) {
-            llama_model_free(session->model);
-            session->model = nullptr;
-        }
+    // Holding the shared_ptr keeps the Session alive even if a generate() call
+    // raced us to lookup(); the mutex below serialises the teardown itself.
+    std::lock_guard<std::mutex> lock(session->mu);
+    destroy_context(session.get());
+    if (session->model != nullptr) {
+        llama_model_free(session->model);
+        session->model = nullptr;
     }
-    // The Session object itself is intentionally not deleted: an in-flight
-    // generate()/cancel() may still hold its pointer after the registry erase.
-    // Leaking ~100 bytes per unload is cheaper than a use-after-free.
+    // The Session object is released when the last shared_ptr (ours, or one held
+    // by an in-flight generate/tokenCount/modelInfo) goes out of scope.
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_localai_agent_inference_LlamaBridge_cancel(JNIEnv *, jclass, jlong handle) {
-    if (auto * session = lookup(handle)) {
+    if (auto session = lookup(handle)) {
         session->cancel.store(true);
+    }
+}
+
+// Drops the KV prefix cache (and with it every decoded position). Used when the
+// conversation is reset so the next request starts from a clean, compact cache.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_localai_agent_inference_LlamaBridge_resetContext(JNIEnv *, jclass, jlong handle) {
+    if (auto session = lookup(handle)) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->ctx != nullptr) {
+            llama_memory_clear(llama_get_memory(session->ctx), /*data=*/true);
+        }
+        session->cached.clear();
     }
 }
 
@@ -359,7 +439,7 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
         jfloat repeat_penalty,
         jobjectArray j_stops,
         jobject sink) {
-    Session * session = lookup(handle);
+    std::shared_ptr<Session> session = lookup(handle);
     if (session == nullptr) return -2;
 
     std::lock_guard<std::mutex> session_lock(session->mu);
@@ -383,20 +463,9 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
     size_t max_stop_len = 0;
     for (const auto & s : stops) max_stop_len = std::max(max_stop_len, s.size());
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = static_cast<uint32_t>(session->n_ctx);
-    cparams.n_batch = static_cast<uint32_t>(session->n_batch);
-    cparams.n_ubatch = static_cast<uint32_t>(session->n_batch);
-    cparams.n_threads = session->n_threads;
-    cparams.n_threads_batch = session->n_threads;
-    cparams.no_perf = true;
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
-
-    llama_context * ctx = llama_init_from_model(session->model, cparams);
-    if (ctx == nullptr) {
-        LOGE("llama_init_from_model failed (n_ctx=%d)", session->n_ctx);
-        return -2;
-    }
+    if (!ensure_context(session.get())) return -2;
+    llama_context * ctx = session->ctx;
+    llama_memory_t mem = llama_get_memory(ctx);
 
     // Tokenize the prompt (special tokens in the template must be parsed as tokens).
     const std::string & text = prompt;
@@ -404,32 +473,54 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
             session->vocab, text.data(), static_cast<int32_t>(text.size()),
             nullptr, 0, /*add_special=*/false, /*parse_special=*/true);
     if (n_tokens < 0) n_tokens = -n_tokens;
-    if (n_tokens <= 0) {
-        llama_free(ctx);
-        return -2;
-    }
+    if (n_tokens <= 0) return -2;
 
     std::vector<llama_token> tokens(static_cast<size_t>(n_tokens));
     const int32_t filled = llama_tokenize(
             session->vocab, text.data(), static_cast<int32_t>(text.size()),
             tokens.data(), n_tokens, false, true);
-    if (filled <= 0) {
-        llama_free(ctx);
-        return -2;
-    }
+    if (filled <= 0) return -2;
     tokens.resize(static_cast<size_t>(filled));
 
     const int32_t budget = session->n_ctx - 8;
     if (static_cast<int32_t>(tokens.size()) > budget) {
         LOGW("prompt too long: %d tokens, context %d", static_cast<int>(tokens.size()), session->n_ctx);
-        llama_free(ctx);
         return -3;
     }
 
-    if (!decode_tokens(ctx, tokens, 0, session->n_batch, /*logits_on_last=*/true)) {
-        llama_free(ctx);
-        return -2;
+    // ---- Prefix cache reconciliation ------------------------------------
+    // Trim the KV cache and `cached` down to the common prefix with the new
+    // prompt, then decode only the tail. One prompt token is always re-decoded
+    // so the logits buffer is guaranteed to match the end of the prompt.
+    int32_t lcp = static_cast<int32_t>(common_prefix_len(session->cached, tokens));
+    if (lcp == static_cast<int32_t>(tokens.size())) --lcp;
+    if (lcp < static_cast<int32_t>(session->cached.size())) {
+        const bool trimmed = llama_memory_seq_rm(mem, /*seq_id=*/0, /*p0=*/lcp, /*p1=*/-1);
+        if (!trimmed) {
+            // SWA-style memories can refuse partial removal; a full reset is
+            // always correct, just slower.
+            llama_memory_clear(mem, /*data=*/true);
+            lcp = 0;
+        }
     }
+    if (lcp == 0) {
+        llama_memory_clear(mem, /*data=*/true);
+    }
+    session->cached.resize(static_cast<size_t>(lcp));
+
+    if (lcp < static_cast<int32_t>(tokens.size())) {
+        std::vector<llama_token> tail(tokens.begin() + lcp, tokens.end());
+        if (!decode_tokens(ctx, tail, lcp, session->n_batch, /*logits_on_last=*/true)) {
+            // The KV state is undefined after a failed decode; force the next
+            // request to start from a clean cache.
+            llama_memory_clear(mem, /*data=*/true);
+            session->cached.clear();
+            return -2;
+        }
+    }
+    session->cached.insert(session->cached.end(), tokens.begin() + lcp, tokens.end());
+
+    int32_t n_past = static_cast<int32_t>(session->cached.size());
 
     llama_sampler * sampler = build_sampler(
             session->vocab,
@@ -438,6 +529,13 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
             top_k,
             repeat_penalty > 0.0f ? repeat_penalty : 1.0f);
 
+    // Seed the penalties window with the prompt tail (cached or freshly decoded)
+    // so repeat penalties behave the same as in the upstream server.
+    const int32_t seed_n = std::min<int32_t>(kPenaltyWindow, n_past);
+    for (int32_t i = n_past - seed_n; i < n_past; ++i) {
+        llama_sampler_accept(sampler, session->cached[i]);
+    }
+
     jclass sink_class = sink != nullptr ? env->GetObjectClass(sink) : nullptr;
     jmethodID on_token = sink_class != nullptr
             ? env->GetMethodID(sink_class, "onToken", "(Ljava/lang/String;)V")
@@ -445,7 +543,6 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
 
     std::string generated;
     std::string pending;
-    int32_t n_past = static_cast<int32_t>(tokens.size());
     int32_t produced = 0;
     int32_t result = 0;
 
@@ -464,6 +561,11 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
         }
         return true;
     };
+
+    // Forward-only start position for stop-sequence scans. Everything before it
+    // was already verified to not start a complete stop sequence, which keeps
+    // the per-token scan O(window) instead of O(generated).
+    size_t stop_search_from = 0;
 
     for (; produced < max_tokens; ++produced) {
         if (session->cancel.load()) { result = -1; break; }
@@ -490,30 +592,36 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
             }
         }
 
-        // Stop sequences are matched against the full generated text.
-        size_t stop_at = std::string::npos;
-        for (const auto & s : stops) {
-            if (s.empty()) continue;
-            const size_t pos = generated.find(s);
-            if (pos != std::string::npos) {
-                stop_at = std::min(stop_at, pos);
+        if (max_stop_len > 0) {
+            // A stop sequence that is still incomplete can only begin in the
+            // last (max_stop_len - 1) bytes, so the scan start only moves forward.
+            if (generated.size() >= max_stop_len) {
+                stop_search_from = std::max(stop_search_from, generated.size() - max_stop_len + 1);
             }
-        }
-        if (stop_at != std::string::npos) {
-            // The stop marker is detected after it has been generated, but up to
-            // (max_stop_len - 1) bytes immediately before it are still in `pending`
-            // because of the holdback. Flush that prefix before discarding the marker;
-            // otherwise the last few characters of every answer (or the closing ```
-            // of a tool call) are silently lost.
-            const size_t emitted = generated.size() - pending.size();
-            if (stop_at > emitted) {
-                size_t tail = std::min(stop_at - emitted, pending.size());
-                tail = utf8_safe_len(pending, tail);
-                if (tail > 0 && !emit(tail)) break;
+            size_t stop_at = std::string::npos;
+            for (const auto & s : stops) {
+                if (s.empty()) continue;
+                const size_t pos = generated.find(s, stop_search_from);
+                if (pos != std::string::npos) {
+                    stop_at = std::min(stop_at, pos);
+                }
             }
-            generated.resize(stop_at);
-            pending.clear();
-            break;
+            if (stop_at != std::string::npos) {
+                // The stop marker is detected after it has been generated, but up to
+                // (max_stop_len - 1) bytes immediately before it are still in `pending`
+                // because of the holdback. Flush that prefix before discarding the marker;
+                // otherwise the last few characters of every answer (or the closing ```
+                // of a tool call) are silently lost.
+                const size_t emitted = generated.size() - pending.size();
+                if (stop_at > emitted) {
+                    size_t tail = std::min(stop_at - emitted, pending.size());
+                    tail = utf8_safe_len(pending, tail);
+                    if (tail > 0 && !emit(tail)) break;
+                }
+                generated.resize(stop_at);
+                pending.clear();
+                break;
+            }
         }
 
         // Hold back a few bytes so a stop sequence is not streamed to the UI.
@@ -528,28 +636,36 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
         llama_batch batch = llama_batch_init(1, 0, 1);
         if (batch.token == nullptr) { result = -2; break; }
         batch.token[0] = id;
-        batch.pos[0] = n_past++;
+        batch.pos[0] = n_past;
         batch.n_seq_id[0] = 1;
         batch.seq_id[0][0] = 0;
         batch.logits[0] = 1;
         batch.n_tokens = 1;
         const int32_t rc = llama_decode(ctx, batch);
         llama_batch_free(batch);
-        if (rc != 0) { result = -2; break; }
+        if (rc != 0) {
+            llama_memory_clear(mem, /*data=*/true);
+            session->cached.clear();
+            result = -2;
+            break;
+        }
+        session->cached.push_back(id);
+        n_past = static_cast<int32_t>(session->cached.size());
 
         // Respect the context budget even if the caller asked for more.
         if (n_past >= session->n_ctx - 1) break;
     }
 
-    // Flush whatever is still on a UTF-8 boundary.
-    if (result == 0 && !pending.empty()) {
+    // Flush whatever is still on a UTF-8 boundary. This includes the cancelled
+    // case: the user asked to stop, so give them the complete partial text
+    // instead of silently dropping the holdback window.
+    if (!pending.empty() && (result == 0 || result == -1)) {
         const size_t safe = utf8_safe_len(pending, pending.size());
         if (safe > 0) emit(safe);
     }
 
     if (sink_class != nullptr) env->DeleteLocalRef(sink_class);
     llama_sampler_free(sampler);
-    llama_free(ctx);
 
     if (result != 0) return result;
     return produced > 0 ? produced : 1;
@@ -558,8 +674,14 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_localai_agent_inference_LlamaBridge_tokenCount(
         JNIEnv * env, jclass, jlong handle, jstring j_text) {
-    Session * session = lookup(handle);
+    std::shared_ptr<Session> session = lookup(handle);
     if (session == nullptr) return -1;
+
+    // modelInfo/tokenCount used to read the model pointer without a lock, which
+    // raced freeModel(). The session mutex is held for the whole generation, so
+    // this only ever blocks behind an in-flight generation.
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (session->vocab == nullptr) return -1;
 
     const std::string text = to_utf8(env, j_text);
     int32_t n = llama_tokenize(
@@ -570,8 +692,11 @@ Java_dev_localai_agent_inference_LlamaBridge_tokenCount(
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_localai_agent_inference_LlamaBridge_modelInfo(JNIEnv * env, jclass, jlong handle) {
-    Session * session = lookup(handle);
+    std::shared_ptr<Session> session = lookup(handle);
     if (session == nullptr) return env->NewStringUTF("{}");
+
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (session->model == nullptr) return env->NewStringUTF("{}");
 
     char desc[512] = {0};
     llama_model_desc(session->model, desc, sizeof(desc));

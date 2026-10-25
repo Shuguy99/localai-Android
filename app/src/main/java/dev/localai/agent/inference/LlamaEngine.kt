@@ -51,8 +51,11 @@ sealed interface GenerationResult {
 }
 
 /**
- * Owns the single loaded model. Generation is serialised: one model, one context,
- * one request at a time. Callers run on a background dispatcher; the UI never blocks.
+ * Owns the single loaded model. Generation is serialised: one model, one
+ * persistent context, one request at a time. The native side reuses the KV
+ * prefix between requests, so agent steps that share the system prompt and
+ * history re-decode only their tail. Callers run on a background dispatcher;
+ * the UI never blocks.
  */
 class LlamaEngine {
 
@@ -118,6 +121,16 @@ class LlamaEngine {
             handle = 0L
         }
         _state.value = EngineState.Unloaded
+    }
+
+    /**
+     * Drops the native KV prefix cache. Called when the user starts a new chat:
+     * the next request then re-decodes from scratch instead of matching against
+     * tokens that belong to the discarded conversation.
+     */
+    suspend fun resetConversation() = mutex.withLock {
+        val h = handle
+        if (h != 0L) withContext(Dispatchers.Default) { LlamaBridge.resetContext(h) }
     }
 
     fun isReady(): Boolean = _state.value is EngineState.Ready && handle != 0L
