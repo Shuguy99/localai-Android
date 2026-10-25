@@ -20,6 +20,38 @@ data class ToolResult(
 class ToolException(message: String) : IOException(message)
 
 /**
+ * Pure guest-path mapping used by the file tools. Jails absolute guest paths to
+ * /workspace and /shared, resolving symlinks and `..` against the real backing
+ * directories before every access. Kept separate from ToolExecutor so the jail
+ * can be unit-tested without an Android context.
+ */
+internal object GuestPaths {
+
+    fun resolve(alpineRootfs: File, sharedDir: File, guestPath: String): File {
+        val path = guestPath.trim()
+        if (!path.startsWith("/")) throw ToolException("path must be absolute (got '$path')")
+        val allowedPrefix = listOf("/workspace", "/shared").firstOrNull {
+            path == it || path.startsWith("$it/")
+        } ?: throw ToolException("path must be inside /workspace or /shared")
+
+        // /shared is a PRoot bind mount of a separate host directory, not a
+        // subdirectory of alpineRootfs. Resolve each prefix to its real backing dir.
+        val allowedRoot = when (allowedPrefix) {
+            "/workspace" -> File(alpineRootfs, "workspace").canonicalFile
+            else -> sharedDir.canonicalFile
+        }
+        val relative = path.removePrefix(allowedPrefix).trimStart('/')
+        val target = File(allowedRoot, relative).canonicalFile
+        if (target.path != allowedRoot.path &&
+            !target.path.startsWith(allowedRoot.path + File.separator)
+        ) {
+            throw ToolException("path escapes $allowedPrefix")
+        }
+        return target
+    }
+}
+
+/**
  * The four tools exposed to the model. File paths are jailed to /workspace and
  * /shared; `exec_shell` is deliberately more powerful (that is the point of the
  * container) and is protected by timeout, output cap, a soft deny-list and the
@@ -66,8 +98,16 @@ class ToolExecutor(private val container: ContainerManager) {
         }
         val bytes = file.inputStream().use { input ->
             val buf = ByteArray(maxBytes)
-            val n = input.read(buf)
-            if (n <= 0) ByteArray(0) else buf.copyOf(n)
+            var off = 0
+            // A single read() may return fewer bytes than available (slow
+            // storage, network-backed files), which would look like a bogus
+            // truncation. Loop until the buffer is full or the stream ends.
+            while (off < maxBytes) {
+                val n = input.read(buf, off, maxBytes - off)
+                if (n < 0) break
+                off += n
+            }
+            if (off <= 0) ByteArray(0) else buf.copyOf(off)
         }
         if (bytes.any { it == 0.toByte() }) {
             return ToolResult(true, "binary file ($path, ${file.length()} bytes) — not displayed")
@@ -172,28 +212,8 @@ class ToolExecutor(private val container: ContainerManager) {
      * Maps an absolute guest path to the host file inside the rootfs, rejecting
      * escapes via `..` or symlinks. Only /workspace and /shared are writable.
      */
-    private fun resolve(guestPath: String): File {
-        val path = guestPath.trim()
-        if (!path.startsWith("/")) throw ToolException("path must be absolute (got '$path')")
-        val allowedPrefix = listOf("/workspace", "/shared").firstOrNull {
-            path == it || path.startsWith("$it/")
-        } ?: throw ToolException("path must be inside /workspace or /shared")
-
-        // /shared is a PRoot bind mount of a separate host directory, not a
-        // subdirectory of alpineRootfs. Resolve each prefix to its real backing dir.
-        val allowedRoot = when (allowedPrefix) {
-            "/workspace" -> File(container.alpineRootfs, "workspace").canonicalFile
-            else -> container.sharedDir.canonicalFile
-        }
-        val relative = path.removePrefix(allowedPrefix).trimStart('/')
-        val target = File(allowedRoot, relative).canonicalFile
-        if (target.path != allowedRoot.path &&
-            !target.path.startsWith(allowedRoot.path + File.separator)
-        ) {
-            throw ToolException("path escapes $allowedPrefix")
-        }
-        return target
-    }
+    private fun resolve(guestPath: String): File =
+        GuestPaths.resolve(container.alpineRootfs, container.sharedDir, guestPath)
 
     private fun stringArg(args: JsonObject, key: String): String? =
         (args[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
