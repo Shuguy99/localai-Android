@@ -110,6 +110,50 @@ class ToolCallParserTest {
         assertNull(ToolCallParser.parse("Sure, I can help with that. No tool call here."))
     }
 
+    @Test
+    fun acceptsToolCallTagVariant() {
+        val text = """
+            Checking the workspace.
+            <tool_call>
+            {"name":"list_dir","arguments":{"path":"/workspace"}}
+            </tool_call>
+        """.trimIndent()
+
+        val call = parseOrFail(text)
+        assertEquals("list_dir", call.name)
+        assertEquals("/workspace", call.arguments["path"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun acceptsShortToolTagVariant() {
+        val text = """
+            <tool>
+            {"name":"read_file","arguments":{"path":"/workspace/x"}}
+            </tool>
+        """.trimIndent()
+
+        val call = parseOrFail(text)
+        assertEquals("read_file", call.name)
+    }
+
+    @Test
+    fun parsesOpenAiStyleFunctionObject() {
+        val text = "```tool\n{\"function\":{\"name\":\"exec_shell\",\"arguments\":{\"command\":\"id\"}}}\n```"
+
+        val call = parseOrFail(text)
+        assertEquals("exec_shell", call.name)
+        assertEquals("id", call.arguments["command"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun bareJsonStartIndexPointsAtObjectStart() {
+        val text = "Working on it.\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"/workspace/x\"}}"
+
+        val call = parseOrFail(text)
+        assertEquals("read_file", call.name)
+        assertEquals("Working on it.\n", text.take(call.startIndex))
+    }
+
     private fun parseOrFail(text: String): ToolCall =
         ToolCallParser.parse(text) ?: throw AssertionError("expected a tool call in: $text")
 }
