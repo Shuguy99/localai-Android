@@ -205,6 +205,9 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
         history.clear()
         activeAssistantId = null
         _state.update { it.copy(messages = emptyList(), error = null, step = 0) }
+        // The old conversation's KV prefix is dead weight now; drop it so the
+        // next request re-decodes from a clean cache.
+        viewModelScope.launch { runCatching { app.runtime.resetConversation() } }
     }
 
     fun dismissError() {

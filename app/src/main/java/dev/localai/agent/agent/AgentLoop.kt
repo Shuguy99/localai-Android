@@ -212,6 +212,9 @@ class AgentRuntime(
 
     suspend fun unloadModel() = engine.unload()
 
+    /** Drops the native KV prefix cache; call when the conversation is reset. */
+    suspend fun resetConversation() = engine.resetConversation()
+
     suspend fun runTurn(
         userText: String,
         history: List<ChatTurn>,
