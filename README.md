@@ -25,7 +25,7 @@ container (simulated root, no host root required).
 
 | Area | Implementation |
 |---|---|
-| Inference | llama.cpp v0.7.0 via JNI, ARM64 CPU, mmap weights, per-request context, streaming tokens, cancellation, stop sequences, sampler chain (top-k/top-p/temp/penalties) |
+| Inference | llama.cpp v0.7.0 via JNI, ARM64 CPU, mmap weights, persistent context with token-level KV prefix reuse, streaming tokens, cancellation, stop sequences, sampler chain (top-k/top-p/temp/penalties) |
 | Prompting | Kotlin chat templates: ChatML/Qwen, Llama 3, Gemma, Mistral, Phi-3 + AUTO detection and manual override |
 | Model discovery | `GET /api/models?search=…&filter=gguf&full=true`, detail lookup with `blobs=true` for file sizes |
 | Downloads | Resumable `Range` downloads, `.part` files, progress flow, free-space check, GGUF magic + size verification, gated/401/403 handling |
@@ -62,10 +62,18 @@ The container code does not call `su`, does not touch `/system`, and declares th
 `INTERNET` and `FOREGROUND_SERVICE` permissions. Real host root is intentionally **not**
 implemented; if you add it, gate it behind an explicit warning and a separate build.
 
-**Per-request `llama_context`.** The JNI layer loads weights once and creates a fresh
-context per generation. It costs a few hundred milliseconds but makes KV lifetime,
-cancellation and memory accounting simple. A later optimization is prefix caching with a
-persistent context.
+**Persistent context with KV prefix reuse.** The JNI layer loads weights once and keeps one
+`llama_context` per model session. It also tracks the exact token sequence currently resident
+in the KV cache; on each `generate()` it computes the longest common prefix with the new
+prompt, trims the cache past that point (`llama_memory_seq_rm`), and decodes only the tail.
+Agent steps share the system prompt, conversation history and earlier tool observations, so
+step N typically re-decodes a few hundred tokens instead of the whole multi-thousand-token
+prompt — with a 2B–4B Q4_K_M model this is the difference between seconds and tens of
+seconds per step. Correctness fallbacks are explicit: if the memory refuses a partial trim
+(SWA-style caches may), or a decode fails, the cache is cleared and the request re-decodes
+from scratch. When a new prompt is fully covered by the cache, the last prompt token is
+re-decoded so the logits buffer always matches the prompt tail. **New Chat** drops the cache
+via `LlamaBridge.resetContext`, so a discarded conversation never pollutes the next one.
 
 ## Repository layout
 
@@ -224,6 +232,11 @@ before anything is loaded. The comparison is against `ActivityManager.MemoryInfo
 (not total RAM). Warning at 50%, danger at 70%. Weights are mmap'd; the app does not request
 `largeHeap`.
 
+The persistent context holds the full `n_ctx` KV allocation for as long as the model is
+loaded — the same peak memory the per-request design allocated during generation, just kept
+resident while idle. The foreground service already pins the app for the model's lifetime,
+so the effective footprint is unchanged.
+
 ## Hugging Face notes
 
 - `Authorization: Bearer <token>` is added only if you saved a token in Settings; the token
@@ -285,11 +298,16 @@ contained in the unbundled rootfs.
       memory estimate stays in the same range.
 - [ ] Airplane mode: chat still works (no network calls); model list shows an error only
       when you search.
+- [ ] Prefix reuse: ask a question, then a follow-up in the same chat — the second prompt
+      processes visibly faster (logcat shows a small decode tail, not the full prompt).
+- [ ] New Chat → the next prompt re-decodes from scratch (no stale-cache artifacts in the
+      answer) and the KV allocation starts compact again.
 
 ## Known limitations / next steps
 
 - Sharded GGUF files are skipped (single-file models only).
-- No persistent KV cache yet; each step re-evaluates the full prompt (correct, slower).
+- KV prefix reuse falls back to a full re-decode on SWA-style memories that refuse partial
+  cache trims (correct, just slower for those architectures).
 - GPU offload is plumbed through `n_gpu_layers`, but the default build is CPU-only.
 - No chat history persistence beyond the process; settings do persist.
 - The standard flavor cannot run the container by design (Android W^X).

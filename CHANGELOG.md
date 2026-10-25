@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.2.0 — 2026-10-25
+
+Performance and reliability pass over the inference core and the agent tooling.
+
+### Added
+
+- Persistent `llama_context` with token-level KV prefix reuse in the JNI layer. Each
+  `generate()` computes the longest common prefix between the cached tokens and the new
+  prompt, trims the KV cache past that point (`llama_get_memory` + `llama_memory_seq_rm`)
+  and decodes only the tail. Agent steps that share the system prompt and history now
+  re-decode hundreds of tokens instead of the whole prompt.
+- Correctness fallbacks for the cache: a full clear + re-decode when a memory refuses a
+  partial trim (SWA-style caches) or when a decode fails mid-flight; the last prompt token
+  is re-decoded when the cache fully covers the prompt so logits always match the prompt tail.
+- `LlamaBridge.resetContext` + `LlamaEngine.resetConversation()`: **New Chat** drops the
+  native KV prefix cache so a discarded conversation never pollutes the next one.
+- OpenAI-style tool calls (`{"function":{"name":...,"arguments":{...}}}`) are now accepted
+  by `ToolCallParser` alongside the fenced/tag/bare shapes.
+- `<tool>` is accepted as a tag variant in addition to `<tool_call>`.
+- Unit tests: OpenAI-style and `<tool>` parsing, bare-JSON start offsets, and a new
+  `GuestPathsTest` covering the path jail (relative paths, `..` escapes, symlink escapes,
+  `/shared` mapping).
+
+### Changed
+
+- Repeat-penalty sampler is seeded with the prompt tail (last 64 tokens), matching the
+  upstream llama.cpp server, so penalties behave the same across cached prefixes.
+- Stop-sequence scan uses a forward-only search window instead of re-scanning the whole
+  generated text every token (O(window) instead of O(length) per token).
+- Cancelled generations now flush the pending UTF-8 holdback, so the partial text shown in
+  the UI is complete instead of missing its last few bytes.
+- README: the "Per-request llama_context" decision note is replaced by the persistent
+  context / prefix-reuse design, including its fallbacks and memory profile.
+
+### Fixed
+
+- `modelInfo` and `tokenCount` read the model/vocab without holding the session mutex,
+  racing `freeModel()` — a use-after-free window. Both now lock the session.
+- Sessions are owned by a `shared_ptr` registry instead of the intentional ~100-byte
+  per-unload leak; an in-flight `generate()` keeps the session alive until it returns.
+- `read_file` issued a single `read()` that could return fewer bytes than available and
+  report a bogus truncation on slow storage; it now loops until the buffer is full or the
+  stream ends.
+- Bare-JSON tool calls reported a wrong `startIndex` (and thus wrong "visible text before
+  the call") when the same object text appeared earlier in the message; the offset is now
+  tracked during the scan.
+
 ## 0.1.0 — 2026-10-24
 
 First public build. Runtime behaviour is **not yet verified on a physical ARM64
