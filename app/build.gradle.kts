@@ -35,8 +35,8 @@ android {
         applicationId = "dev.localai.agent"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 3
+        versionName = "0.2.1"
 
         // ARM64 only: every shipping 2B-4B device we support is arm64-v8a.
         ndk {
