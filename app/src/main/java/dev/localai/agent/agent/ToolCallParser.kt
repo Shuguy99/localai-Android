@@ -36,11 +36,14 @@ object ToolCallParser {
     private val argKeys = listOf("arguments", "args", "parameters", "input")
 
     fun parse(text: String): ToolCall? {
+        // Fences and tags are merged and ordered by position so the candidate that
+        // appears LAST in the text wins, regardless of its shape. Trying fences
+        // before tags (or the reverse) let an earlier tag shadow a later fence.
         val candidates = buildList {
             fenceRegex.findAll(text).forEach { add(it.groupValues[1] to it.range.first) }
             tagRegex.findAll(text).forEach { add(it.groupValues[1] to it.range.first) }
-        }
-        for ((raw, start) in candidates.asReversed()) {
+        }.sortedByDescending { it.second }
+        for ((raw, start) in candidates) {
             parseJson(raw, start)?.let { return it }
         }
         // Last resort: a bare JSON object that names a tool.

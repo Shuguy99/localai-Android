@@ -61,8 +61,12 @@ class SnapshotStore(
             if (!File(snapshotsDir, name).isFile) {
                 return@withContext Result.failure(IllegalArgumentException("No such snapshot: $name"))
             }
+            // Validate the archive BEFORE wiping /workspace: restoring a corrupt
+            // snapshot used to destroy the workspace and leave it empty.
             val result = container.exec(
-                command = "rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null; " +
+                command = "if ! tar -tzf /snapshots/$name >/dev/null 2>&1; then " +
+                    "echo 'snapshot archive is corrupt or incomplete'; exit 3; fi; " +
+                    "rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null; " +
                     "tar -xzf /snapshots/$name -C /workspace",
                 settings = settings,
                 workdir = "/",

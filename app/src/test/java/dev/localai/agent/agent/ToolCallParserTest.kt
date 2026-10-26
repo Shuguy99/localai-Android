@@ -154,6 +154,36 @@ class ToolCallParserTest {
         assertEquals("Working on it.\n", text.take(call.startIndex))
     }
 
+    @Test
+    fun laterTagWinsOverEarlierFence() {
+        val text = """
+            ```tool
+            {"name":"list_dir","arguments":{"path":"/workspace"}}
+            ```
+            <tool_call>
+            {"name":"read_file","arguments":{"path":"/workspace/real.txt"}}
+            </tool_call>
+        """.trimIndent()
+
+        val call = parseOrFail(text)
+        assertEquals("read_file", call.name)
+    }
+
+    @Test
+    fun laterFenceWinsOverEarlierTag() {
+        val text = """
+            <tool_call>
+            {"name":"list_dir","arguments":{"path":"/workspace"}}
+            </tool_call>
+            ```tool
+            {"name":"read_file","arguments":{"path":"/workspace/real.txt"}}
+            ```
+        """.trimIndent()
+
+        val call = parseOrFail(text)
+        assertEquals("read_file", call.name)
+    }
+
     private fun parseOrFail(text: String): ToolCall =
         ToolCallParser.parse(text) ?: throw AssertionError("expected a tool call in: $text")
 }
