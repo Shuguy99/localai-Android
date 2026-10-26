@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.1 — 2026-10-26
+
+Faster generation on the same model: less memory bandwidth, smarter threads, and an
+optional CPU-tuned build.
+
+### Added
+
+- **q8_0 KV cache** (on by default, toggle in Settings → Model): the K/V projections are
+  stored as 8-bit instead of F16, halving the attention memory bandwidth that dominates
+  token-by-token decode on phones. Long chats benefit the most. If the backend cannot
+  serve a quantized V cache, the JNI layer transparently retries with the stock F16
+  cache, so the setting can never break model loading.
+- **Big-core thread auto-detection** (`CpuTopology`): the default thread count is now the
+  number of cores running at 80%+ of the fastest core's frequency, read from sysfs.
+  On big.LITTLE phones this avoids spawning decode threads on the little cluster, where
+  every sync step waits for the slowest core (e.g. Snapdragon 865: 4 threads instead of
+  a naive 8 or 4-by-luck). Falls back to the old cores/2 heuristic when sysfs is
+  unavailable. Covered by unit tests.
+- **`-perf` APK** (`localai-agent-*-proot-perf.apk`): the same app compiled with
+  `-march=armv8.2-a+dotprod`, which roughly doubles prompt processing on every SoC from
+  2019 onwards (Snapdragon 855+, Dimensity 1000+, Helio G-series, Tensor). Install this
+  one if your phone is 2019+; the portable APK remains for older devices.
+- `kvCacheQ8` model setting persisted in DataStore with a Settings switch.
+
+### Changed
+
+- Default thread count and the "CPU threads" slider upper bound derive from the detected
+  big-core count instead of `availableProcessors()`.
+- Model load log line includes the KV cache mode for easier on-device debugging.
+
 ## 0.2.0 — 2026-10-25
 
 Performance and reliability pass over the inference core and the agent tooling.

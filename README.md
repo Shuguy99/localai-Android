@@ -183,6 +183,29 @@ keytool -genkeypair -keystore ~/.localai-release/localai-release.jks -alias loca
 Without that file the release variants build but stay unsigned. Keep the keystore and
 its passwords backed up: Android only accepts updates signed with the same key.
 
+### Performance tuning
+
+Three independent levers, all applied in the 0.2.1 release builds:
+
+1. **q8_0 KV cache** — on by default (`Settings → Model → KV cache q8_0`). Halves the
+   attention memory bandwidth; the JNI layer falls back to F16 automatically if a
+   backend refuses the combination. Quality impact is negligible for K and V.
+2. **Big-core threads** — the default `CPU threads` equals the number of cores within
+   80% of the fastest core's frequency (sysfs), so decode never schedules onto the
+   little cluster of a big.LITTLE SoC. Adjust manually if you know better.
+3. **CPU-tuned `-perf` build** — compiled with `-march=armv8.2-a+dotprod`:
+   ```bash
+   ./gradlew assembleProotRelease -PllamaArmArch=armv8.2-a+dotprod
+   ```
+   Safe on every ARMv8.2 device (Snapdragon 855+, Tensor, Dimensity, Helio G-series,
+   ~2019+). ARMv8.0 phones (2016–2018) must use the portable APK — the tuned build
+   would crash with SIGILL. `+i8mm` can be appended for ARMv8.6 cores (2021+), but
+   that build then requires those cores too.
+
+Not yet wired: Vulkan GPU offload (`-PllamaVulkan=true` needs a glslc-capable build
+image) — on-device decode for 2–4B quants is usually still CPU-bound, so the CPU
+tuning above is the reliable path for now.
+
 
 ## First run
 
