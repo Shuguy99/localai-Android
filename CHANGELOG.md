@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.2 — 2026-10-26
+
+Bug-fix pass over the whole codebase: one native correctness fix, one safety fix in
+the container tooling, and several smaller correctness/accuracy improvements.
+
+### Fixed
+
+- **Stop sequences of exactly the longest length never fired** (native): the
+  forward-only scan window started one byte too far, so a marker whose length equalled
+  `max_stop_len` ("[INST]" for Mistral, "<|im_start|>" for ChatML, "<|end_of_text|>"
+  for Llama 3) was never matched. It leaked into the visible output and the model kept
+  generating past its turn boundary. The scan now starts at `size - max_stop_len`.
+- **Restoring a corrupt snapshot destroyed the workspace** (Container tab): the old
+  restore command wiped `/workspace` before validating the archive. `tar -tzf` now
+  verifies the snapshot first and fails with a clear message, leaving the workspace
+  untouched.
+- **Tool-call candidate order** (parser): fenced blocks and `<tool>`-style tags were
+  tried per-shape instead of by position, so an earlier tag could shadow a later
+  fence. Candidates are now sorted by position; the last call in the text wins.
+- **CPU-threads slider upper bound** (Settings): now uses the detected big-core count
+  (`CpuTopology`), matching the 0.2.1 changelog instead of `availableProcessors()`.
+- **Generation with no stream consumer aborted after one token** (native): `emit()`
+  treated a missing token sink as a failure. A null sink is now a no-op and generation
+  continues.
+- **Memory estimate ignored the q8_0 KV cache**: the pre-load estimate now halves the
+  KV part when the q8_0 cache setting is on (34 bytes per 32 elements instead of
+  F16's 2 bytes per element), removing the systematic 2x over-count for default
+  configurations.
+- **`generate()` return value**: an immediate EOG reported "1 token"; it now reports
+  the actual count. Also guards `NewString(data, 0)` against a null pointer when
+  converting empty chunks.
+
+### Tests
+
+- 60/60 JVM unit tests green (2 new parser-ordering tests).
+
 ## 0.2.1 — 2026-10-26
 
 Faster generation on the same model: less memory bandwidth, smarter threads, and an
