@@ -93,7 +93,7 @@ class LlamaEngine {
 
         val loaded = withContext(Dispatchers.Default) {
             runCatching {
-                LlamaBridge.loadModel(path, ctx, threads, settings.gpuLayers, batch)
+                LlamaBridge.loadModel(path, ctx, threads, settings.gpuLayers, batch, settings.kvCacheQ8)
             }
         }.getOrElse { t ->
             val message = t.message ?: "Model load failed"

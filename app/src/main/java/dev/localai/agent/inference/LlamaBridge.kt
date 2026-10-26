@@ -46,6 +46,7 @@ object LlamaBridge {
         nThreads: Int,
         nGpuLayers: Int,
         nBatch: Int,
+        kvCacheQ8: Boolean,
     ): Long
 
     @JvmStatic

@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import dev.localai.agent.inference.CpuTopology
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -32,6 +33,7 @@ data class ModelSettings(
     val repeatPenalty: Float = 1.1f,
     val contextSize: Int = 4096,
     val threads: Int = defaultThreads(),
+    val kvCacheQ8: Boolean = true,
     val gpuLayers: Int = 0,
     val maxTokens: Int = 512,
     val maxAgentSteps: Int = 6,
@@ -49,8 +51,7 @@ data class ModelSettings(
     }
 }
 
-private fun defaultThreads(): Int =
-    (Runtime.getRuntime().availableProcessors() / 2).coerceIn(2, 6)
+private fun defaultThreads(): Int = CpuTopology.detectBigCoreCount(Runtime.getRuntime().availableProcessors())
 
 data class ContainerSettings(
     val distro: Distro = Distro.ALPINE,
@@ -131,6 +132,7 @@ class SettingsRepository(private val context: Context) {
         val REPEAT_PENALTY = floatPreferencesKey("model.repeat_penalty")
         val CONTEXT_SIZE = intPreferencesKey("model.context_size")
         val THREADS = intPreferencesKey("model.threads")
+        val KV_Q8 = booleanPreferencesKey("model.kv_q8")
         val GPU_LAYERS = intPreferencesKey("model.gpu_layers")
         val MAX_TOKENS = intPreferencesKey("model.max_tokens")
         val MAX_AGENT_STEPS = intPreferencesKey("model.max_agent_steps")
@@ -162,6 +164,7 @@ class SettingsRepository(private val context: Context) {
             repeatPenalty = this[Keys.REPEAT_PENALTY] ?: defaults.repeatPenalty,
             contextSize = this[Keys.CONTEXT_SIZE] ?: defaults.contextSize,
             threads = this[Keys.THREADS] ?: defaults.threads,
+            kvCacheQ8 = this[Keys.KV_Q8] ?: defaults.kvCacheQ8,
             gpuLayers = this[Keys.GPU_LAYERS] ?: defaults.gpuLayers,
             maxTokens = this[Keys.MAX_TOKENS] ?: defaults.maxTokens,
             maxAgentSteps = this[Keys.MAX_AGENT_STEPS] ?: defaults.maxAgentSteps,
@@ -199,6 +202,7 @@ class SettingsRepository(private val context: Context) {
         this[Keys.REPEAT_PENALTY] = m.repeatPenalty
         this[Keys.CONTEXT_SIZE] = m.contextSize
         this[Keys.THREADS] = m.threads
+        this[Keys.KV_Q8] = m.kvCacheQ8
         this[Keys.GPU_LAYERS] = m.gpuLayers
         this[Keys.MAX_TOKENS] = m.maxTokens
         this[Keys.MAX_AGENT_STEPS] = m.maxAgentSteps

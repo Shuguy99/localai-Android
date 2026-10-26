@@ -57,6 +57,10 @@ struct Session {
     int n_ctx = 2048;
     int n_batch = 512;
     int n_threads = 4;
+    // q8_0 KV cache: halves the attention memory bandwidth, which dominates
+    // decode time on phones. Requires flash attention for a quantized V cache;
+    // ensure_context() falls back to F16 when the backend refuses the combo.
+    bool kv_q8 = true;
 
     // Persistent context and the tokens currently resident in its KV cache for
     // sequence 0. Both are guarded by `mu`; `cached.size()` is always the number
@@ -301,13 +305,23 @@ bool ensure_context(Session * s) {
     cparams.no_perf = true;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    s->ctx = llama_init_from_model(s->model, cparams);
-    if (s->ctx == nullptr) {
-        LOGE("llama_init_from_model failed (n_ctx=%d)", s->n_ctx);
-        return false;
+    // First attempt: q8_0 KV when requested. Second attempt: stock F16 KV. A
+    // backend that cannot serve quantized V (no flash attention) fails the
+    // first attempt without side effects, so the retry keeps the session usable.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const bool try_q8 = (attempt == 0 && s->kv_q8);
+        cparams.type_k = try_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        cparams.type_v = try_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        s->ctx = llama_init_from_model(s->model, cparams);
+        if (s->ctx != nullptr) {
+            s->cached.clear();
+            return true;
+        }
+        if (!try_q8) break;
+        LOGW("q8_0 KV context rejected; retrying with F16 KV");
     }
-    s->cached.clear();
-    return true;
+    LOGE("llama_init_from_model failed (n_ctx=%d)", s->n_ctx);
+    return false;
 }
 
 // Length of the longest common prefix of the cached KV tokens and the new prompt.
@@ -343,7 +357,8 @@ Java_dev_localai_agent_inference_LlamaBridge_loadModel(
         jint n_ctx,
         jint n_threads,
         jint n_gpu_layers,
-        jint n_batch) {
+        jint n_batch,
+        jboolean kv_q8) {
     if (!g_backend_ready.load()) {
         LOGE("loadModel called before backendInit");
         return 0;
@@ -355,8 +370,8 @@ Java_dev_localai_agent_inference_LlamaBridge_loadModel(
     mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
     mparams.check_tensors = false;
 
-    LOGI("loading model %s (n_ctx=%d threads=%d gpu_layers=%d)",
-         path.c_str(), n_ctx, n_threads, n_gpu_layers);
+    LOGI("loading model %s (n_ctx=%d threads=%d gpu_layers=%d kv_q8=%d)",
+         path.c_str(), n_ctx, n_threads, n_gpu_layers, static_cast<int>(kv_q8));
 
     llama_model * model = llama_model_load_from_file(path.c_str(), mparams);
     if (model == nullptr) {
@@ -376,6 +391,7 @@ Java_dev_localai_agent_inference_LlamaBridge_loadModel(
     session->n_ctx = n_ctx > 0 ? n_ctx : 2048;
     session->n_threads = n_threads > 0 ? n_threads : 4;
     session->n_batch = n_batch > 0 ? n_batch : 512;
+    session->kv_q8 = (kv_q8 != JNI_FALSE);
 
     {
         std::lock_guard<std::mutex> lock(g_registry_mu);

@@ -147,6 +147,11 @@ fun SettingsScreen(
                     display = { it.roundToInt().toString() },
                     onChange = { v -> vm.updateModel { it.copy(gpuLayers = v.roundToInt()) } },
                 )
+                SwitchRow(
+                    label = "KV cache q8_0 (faster decoding)",
+                    checked = model.kvCacheQ8,
+                    onChange = { v -> vm.updateModel { it.copy(kvCacheQ8 = v) } },
+                )
                 SliderSetting(
                     label = "Max tokens per reply",
                     value = model.maxTokens.toFloat(),
