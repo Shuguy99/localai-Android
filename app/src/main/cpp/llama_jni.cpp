@@ -161,6 +161,9 @@ jstring from_utf8(JNIEnv * env, const std::string & s) {
             utf16.push_back(static_cast<jchar>(0xDC00 + (cp & 0x3FF)));
         }
     }
+    // NewString(data, 0) is not required to accept a null pointer; give it a real
+    // empty string instead.
+    if (utf16.empty()) return env->NewStringUTF("");
     return env->NewString(utf16.data(), static_cast<jsize>(utf16.size()));
 }
 
@@ -563,7 +566,10 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
     int32_t result = 0;
 
     auto emit = [&](size_t up_to) {
-        if (up_to == 0 || on_token == nullptr || sink == nullptr) return false;
+        if (up_to == 0) return false;
+        // No consumer registered: dropping the chunk is success, not failure —
+        // returning false here would abort generation after the first token.
+        if (on_token == nullptr || sink == nullptr) return true;
         const std::string chunk = pending.substr(0, up_to);
         pending.erase(0, up_to);
         jstring js = from_utf8(env, chunk);
@@ -611,8 +617,13 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
         if (max_stop_len > 0) {
             // A stop sequence that is still incomplete can only begin in the
             // last (max_stop_len - 1) bytes, so the scan start only moves forward.
+            // A sequence that JUST completed starts at size-L >= size-max_stop_len,
+            // so the scan window must include size-max_stop_len; the previous
+            // "size - max_stop_len + 1" skipped every marker whose length equalled
+            // max_stop_len ("[INST]", "<|im_start|>", "<|end_of_text|>"), letting
+            // it leak into the output and never stop the generation.
             if (generated.size() >= max_stop_len) {
-                stop_search_from = std::max(stop_search_from, generated.size() - max_stop_len + 1);
+                stop_search_from = std::max(stop_search_from, generated.size() - max_stop_len);
             }
             size_t stop_at = std::string::npos;
             for (const auto & s : stops) {
@@ -684,7 +695,7 @@ Java_dev_localai_agent_inference_LlamaBridge_generate(
     llama_sampler_free(sampler);
 
     if (result != 0) return result;
-    return produced > 0 ? produced : 1;
+    return produced;
 }
 
 extern "C" JNIEXPORT jint JNICALL
