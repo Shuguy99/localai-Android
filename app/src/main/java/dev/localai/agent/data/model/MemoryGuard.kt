@@ -45,7 +45,7 @@ class MemoryGuard(context: Context) {
             }
     }
 
-    fun estimate(modelFile: File, contextSize: Int): Estimate {
+    fun estimate(modelFile: File, contextSize: Int, kvQ8: Boolean = true): Estimate {
         val info = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(info)
         val available = info.availMem.coerceAtLeast(1L)
@@ -66,7 +66,12 @@ class MemoryGuard(context: Context) {
         ) {
             val headDim = embeddingLength / headCount
             val elements = 2L * blockCount * contextSize * kvHeads * headDim
-            elements * 2L // f16 K and V
+            // f16 K and V = 2 bytes per element; q8_0 KV = 34 bytes per 32-element
+            // block (1.0625 byte/element). The runtime falls back to F16 when a
+            // backend refuses the quantized cache, in which case this under-counts
+            // by ~2x on the KV part — still far better than over-counting for
+            // every default-config load.
+            if (kvQ8) elements * 17L / 16L else elements * 2L
         } else {
             // Conservative fallback: ~64 KiB per context token for a 2B-4B class model.
             contextSize.toLong() * 64L * 1024L

@@ -234,7 +234,11 @@ class ModelsViewModel(private val app: AppContainer) : ViewModel() {
                 return@launch
             }
             val estimate = withContext(Dispatchers.IO) {
-                app.memoryGuard.estimate(file, _state.value.settings.model.contextSize)
+                app.memoryGuard.estimate(
+                    file,
+                    _state.value.settings.model.contextSize,
+                    _state.value.settings.model.kvCacheQ8,
+                )
             }
             if (estimate.level == MemoryGuard.Estimate.Level.OK) {
                 doLoad(path)

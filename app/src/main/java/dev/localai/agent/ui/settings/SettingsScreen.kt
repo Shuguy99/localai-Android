@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.localai.agent.data.settings.PromptFormat
+import dev.localai.agent.inference.CpuTopology
 import dev.localai.agent.ui.AppViewModelFactory
 import dev.localai.agent.ui.Badge
 import dev.localai.agent.ui.ScreenHeader
@@ -52,8 +53,12 @@ fun SettingsScreen(
     var tokenInput by remember { mutableStateOf("") }
     var systemPrompt by remember(model.systemPrompt) { mutableStateOf(model.systemPrompt) }
     var formatMenu by remember { mutableStateOf(false) }
-    val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
-    val maxThreads = cores.coerceAtLeast(2)
+    // Match the CHANGELOG: the slider upper bound is the detected big-core count,
+    // not the total core count — spawning decode threads on the little cluster
+    // only slows every sync step down.
+    val maxThreads = CpuTopology
+        .detectBigCoreCount(Runtime.getRuntime().availableProcessors())
+        .coerceAtLeast(2)
 
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(title = "Settings", subtitle = "Model, prompt and container limits")
