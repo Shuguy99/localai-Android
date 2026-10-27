@@ -53,6 +53,7 @@ data class ModelsUiState(
     val settings: AppSettings = AppSettings(),
     val memoryEstimate: MemoryGuard.Estimate? = null,
     val pendingLoadPath: String? = null,
+    val availableRamBytes: Long = 0,
 )
 
 class ModelsViewModel(private val app: AppContainer) : ViewModel() {
@@ -86,7 +87,30 @@ class ModelsViewModel(private val app: AppContainer) : ViewModel() {
             }
         }
         refreshInstalled()
+        refreshAvailableRam()
         search()
+    }
+
+    /** Available RAM is a moving target; re-read it whenever the screen refreshes. */
+    private fun refreshAvailableRam() {
+        _state.update { it.copy(availableRamBytes = app.memoryGuard.availableRam()) }
+    }
+
+    /** Opens a featured catalog entry without a round-trip through search. */
+    fun selectRepo(repoId: String) {
+        select(HfModel(id = repoId))
+    }
+
+    /**
+     * Pre-download RAM fit for a remote file: no GGUF header exists yet, so the
+     * KV cache uses the conservative per-token heuristic.
+     */
+    fun remoteFileLevel(sizeBytes: Long?): MemoryGuard.Estimate.Level? {
+        val size = sizeBytes ?: return null
+        if (size <= 0 || _state.value.availableRamBytes <= 0) return null
+        return app.memoryGuard
+            .estimateForSize(size, _state.value.settings.model.contextSize, _state.value.availableRamBytes)
+            .level
     }
 
     fun onQueryChange(value: String) {
@@ -96,6 +120,7 @@ class ModelsViewModel(private val app: AppContainer) : ViewModel() {
     fun search() {
         val query = _state.value.query.trim()
         if (query.isEmpty()) return
+        refreshAvailableRam()
         viewModelScope.launch {
             _state.update { it.copy(searching = true, error = null) }
             try {

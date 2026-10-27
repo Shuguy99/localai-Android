@@ -3,6 +3,8 @@ package dev.localai.agent.ui.models
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -58,7 +60,6 @@ fun ModelsScreen(
     vm: ModelsViewModel = viewModel(factory = factory),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
-
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(
             title = "Models",
@@ -107,6 +108,20 @@ fun ModelsScreen(
                 }
             }
 
+            item(key = "featured-header") {
+                Text(
+                    "Featured",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+            item(key = "featured-chips") {
+                FeaturedRow(
+                    enabled = state.selected == null && !state.loadingDetails,
+                    onSelect = vm::selectRepo,
+                )
+            }
+
             state.selected?.let { model ->
                 item(key = "selected-header") {
                     SelectedHeader(model, onClose = vm::closeSelection)
@@ -118,6 +133,7 @@ fun ModelsScreen(
                     FileRow(
                         file = file,
                         download = state.downloads["${file.modelId}/${file.fileName}"],
+                        ramLevel = vm.remoteFileLevel(file.size),
                         onDownload = { vm.download(file) },
                         onCancel = { vm.cancelDownload("${file.modelId}/${file.fileName}") },
                         onDismiss = { vm.dismissDownload("${file.modelId}/${file.fileName}") },
@@ -220,6 +236,37 @@ fun ModelsScreen(
     }
 }
 
+/**
+ * Curated single-file GGUF repos, ungated, covering the 1B–4B range that fits
+ * mid-range phones. Tapping opens the repo file list via the normal details flow.
+ */
+private val featuredRepos = listOf(
+    "Qwen/Qwen2.5-1.5B-Instruct-GGUF" to "Qwen2.5 1.5B",
+    "Qwen/Qwen2.5-3B-Instruct-GGUF" to "Qwen2.5 3B",
+    "bartowski/Llama-3.2-3B-Instruct-GGUF" to "Llama 3.2 3B",
+    "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF" to "DeepSeek-R1 1.5B",
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF" to "SmolLM2 1.7B",
+    "bartowski/Phi-3.5-mini-instruct-GGUF" to "Phi-3.5 mini",
+)
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FeaturedRow(enabled: Boolean, onSelect: (String) -> Unit) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        featuredRepos.forEach { (repoId, label) ->
+            AssistChip(
+                onClick = { if (enabled) onSelect(repoId) },
+                label = { Text(label) },
+                enabled = enabled,
+            )
+        }
+    }
+}
+
 @Composable
 private fun SelectedHeader(model: HfModel, onClose: () -> Unit) {
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
@@ -252,6 +299,7 @@ private fun SelectedHeader(model: HfModel, onClose: () -> Unit) {
 private fun FileRow(
     file: HfFile,
     download: DownloadUi?,
+    ramLevel: MemoryGuard.Estimate.Level?,
     onDownload: () -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
@@ -273,6 +321,15 @@ private fun FileRow(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+                ramLevel?.let { level ->
+                    val (label, color) = when (level) {
+                        MemoryGuard.Estimate.Level.OK -> "fits" to MaterialTheme.colorScheme.primary
+                        MemoryGuard.Estimate.Level.WARN -> "tight" to MaterialTheme.colorScheme.secondary
+                        MemoryGuard.Estimate.Level.DANGER -> "risky" to MaterialTheme.colorScheme.error
+                    }
+                    Badge(label, color)
+                    Spacer(Modifier.width(6.dp))
                 }
                 when (download?.status) {
                     DownloadStatus.RUNNING -> IconButton(onClick = onCancel) {

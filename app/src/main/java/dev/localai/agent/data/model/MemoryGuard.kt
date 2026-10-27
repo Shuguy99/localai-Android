@@ -89,7 +89,49 @@ class MemoryGuard(context: Context) {
         )
     }
 
-    private companion object {
-        const val RUNTIME_OVERHEAD_BYTES = 128L * 1024 * 1024
+    /** Currently available RAM in bytes (the model must coexist with everything else). */
+    fun availableRam(): Long {
+        val info = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(info)
+        return info.availMem.coerceAtLeast(1L)
+    }
+
+    data class SizeEstimate(
+        val totalBytes: Long,
+        val availableBytes: Long,
+        val ratio: Double,
+    ) {
+        val level: Estimate.Level
+            get() = levelFor(ratio)
+    }
+
+    /**
+     * Size-only estimate for a file that has not been downloaded yet: the GGUF
+     * header is unavailable, so the KV cache uses the same conservative
+     * per-token heuristic as the no-metadata fallback in [estimate].
+     */
+    fun estimateForSize(fileSizeBytes: Long, contextSize: Int, availableBytes: Long): SizeEstimate {
+        val total = sizeOnlyTotalBytes(fileSizeBytes, contextSize)
+        return SizeEstimate(
+            totalBytes = total,
+            availableBytes = availableBytes,
+            ratio = total.toDouble() / availableBytes.coerceAtLeast(1L).toDouble(),
+        )
+    }
+
+    companion object {
+        private const val RUNTIME_OVERHEAD_BYTES = 128L * 1024 * 1024
+
+        /** Pure helper so the remote-file estimate is unit-testable without Android. */
+        fun sizeOnlyTotalBytes(fileSizeBytes: Long, contextSize: Int): Long =
+            (fileSizeBytes * 1.02).toLong() + RUNTIME_OVERHEAD_BYTES +
+                contextSize.toLong() * 64L * 1024L
+
+        /** Pure threshold helper, same cut-offs as [Estimate.level]. */
+        fun levelFor(ratio: Double): Estimate.Level = when {
+            ratio >= 0.70 -> Estimate.Level.DANGER
+            ratio >= 0.50 -> Estimate.Level.WARN
+            else -> Estimate.Level.OK
+        }
     }
 }
