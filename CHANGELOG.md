@@ -39,6 +39,19 @@ models are easier to pick, and the project now builds itself on every push.
 
 - `MemoryGuard` gained a pure, unit-testable size-only estimate path used for
   remote files (metadata-based estimates for local files are unchanged).
+- **Anti-loop guard** (from the 0.2.2 field report): when the exact same tool
+  call fails twice in a row, the observation now carries a system note telling
+  the model to stop repeating itself — verify package names with
+  `apk search`, try another tool, or report the blocker. Previously a wrong
+  package name (e.g. `py3-pytz`, which does not exist in Alpine) aborted the
+  whole `apk add` transaction and the model retried the identical command
+  until the step limit burned out.
+- The system prompt now documents the `apk` all-or-nothing transaction rule
+  and that main + community repos are enabled (community arrived in 0.2.3;
+  on 0.2.2 packages like `aircrack-ng` could not install at all).
+- **Default max agent steps raised 6 → 12** and the Settings slider now goes
+  to 24 (hard cap 32). Six steps were routinely too few for
+  install → write → run → fix cycles; the 0.2.2 report hit the limit mid-task.
 
 ## 0.2.3 — 2026-10-27
 

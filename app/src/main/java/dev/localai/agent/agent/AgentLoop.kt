@@ -54,7 +54,8 @@ class AgentLoop(
         listener: AgentListener,
     ): TurnResult {
         val model = settings.model
-        val maxSteps = model.maxAgentSteps.coerceIn(1, 16)
+        val maxSteps = model.maxAgentSteps.coerceIn(1, 32)
+        val failureGuard = RepeatFailureGuard()
         engine.beginTurn()
         val format = PromptBuilder.detectFormat(settings.selectedModelPath.orEmpty(), model.promptFormat)
         val system = systemPrompt(settings)
@@ -137,7 +138,9 @@ class AgentLoop(
                         tools.execute(call, settings.container)
                     }
                     val output = toolResult.output.take(MAX_OBSERVATION)
-                    listener.onToolFinished(id, call.name, toolResult.ok, output)
+                    val signature = RepeatFailureGuard.signature(call.name, preview(call))
+                    val observation = output + (failureGuard.record(signature, toolResult.ok) ?: "")
+                    listener.onToolFinished(id, call.name, toolResult.ok, observation)
 
                     if (engine.isCancellationRequested()) {
                         listener.onNotice("Stopped.")
@@ -146,7 +149,7 @@ class AgentLoop(
 
                     conversation += ChatTurn(
                         ChatRole.USER,
-                        PromptBuilder.observation(call.name, toolResult.ok, output),
+                        PromptBuilder.observation(call.name, toolResult.ok, observation),
                     )
 
                     if (step == maxSteps) {
@@ -182,6 +185,11 @@ class AgentLoop(
         append("- Scratch space: /tmp; shared folder: /shared\n")
         append("- A shell, busybox tools, apk and musl libc are available. Python/Node are NOT preinstalled.\n")
         append("- Use `apk add --no-cache <pkg>` only when the task truly requires it.\n")
+        append(
+            "- If `apk add` fails with 'no such package', NOTHING is installed: verify names " +
+                "with `apk search <term>` and retry only with packages that exist " +
+                "(main and community repos are enabled; e.g. pytz is py3-tz, not py3-pytz).\n",
+        )
 
         append("\n# Tools\n")
         append("read_file  {\"path\":\"/workspace/file\",\"max_bytes\":32768}\n")

@@ -168,8 +168,8 @@ fun SettingsScreen(
                 SliderSetting(
                     label = "Max agent tool steps",
                     value = model.maxAgentSteps.toFloat(),
-                    range = 1f..12f,
-                    steps = 10,
+                    range = 1f..24f,
+                    steps = 23,
                     display = { it.roundToInt().toString() },
                     onChange = { v -> vm.updateModel { it.copy(maxAgentSteps = v.roundToInt()) } },
                 )

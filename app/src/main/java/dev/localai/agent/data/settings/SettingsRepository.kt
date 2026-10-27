@@ -36,7 +36,7 @@ data class ModelSettings(
     val kvCacheQ8: Boolean = true,
     val gpuLayers: Int = 0,
     val maxTokens: Int = 512,
-    val maxAgentSteps: Int = 6,
+    val maxAgentSteps: Int = 12,
     val promptFormat: PromptFormat = PromptFormat.AUTO,
     val systemPrompt: String = DEFAULT_SYSTEM_PROMPT,
 ) {
