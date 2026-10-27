@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Run JVM unit tests (both flavors)
+        run: ./gradlew testStandardDebugUnitTest testProotDebugUnitTest --stacktrace
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+
+  build:
+    name: APK (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: portable
+            gradle-args: ''
+          - name: perf
+            # dotprod ISAs only exist on ARMv8.2+; the portable variant is the default.
+            gradle-args: '-PllamaArmArch=armv8.2-a+dotprod'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # The hosted runner has the Android SDK with accepted licenses; AGP
+      # auto-installs the pinned NDK 27.0.12077973 and CMake 3.22.1 on first use.
+      - name: Build proot release APK
+        run: >
+          ./gradlew assembleProotRelease
+          -x lintVitalProotRelease
+          --stacktrace
+          ${{ matrix.gradle-args }}
+
+      - name: Sign with a debug key
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          # Release signing material never leaves the maintainer's machine, so CI
+          # artifacts are debug-signed instead: still installable for side-load
+          # testing, clearly not a release build.
+          KS="$HOME/.android/debug.keystore"
+          if [ ! -f "$KS" ]; then
+            keytool -genkeypair -keystore "$KS" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)"
+          mkdir -p dist
+          for apk in app/build/outputs/apk/proot/release/*.apk; do
+            out="dist/localai-agent-0.2.4-proot-${{ matrix.name }}-ci.apk"
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
+              --out "$out" "$apk"
+            "$BT/apksigner" verify "$out"
+            echo "signed: $out"
+          done
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.name }}
+          path: dist/*.apk
+          if-no-files-found: error
