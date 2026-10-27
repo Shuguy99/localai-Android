@@ -58,6 +58,11 @@ jobs:
           java-version: '17'
           cache: gradle
 
+      # llama.cpp, PRoot and the Alpine rootfs are intentionally not committed
+      # (see .gitignore); fetch the pinned versions with checksum verification.
+      - name: Fetch pinned native deps (llama.cpp, PRoot, Alpine)
+        run: bash scripts/fetch_deps.sh
+
       # The hosted runner has the Android SDK with accepted licenses; AGP
       # auto-installs the pinned NDK 27.0.12077973 and CMake 3.22.1 on first use.
       - name: Build proot release APK
@@ -83,7 +88,8 @@ jobs:
           BT="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)"
           mkdir -p dist
           for apk in app/build/outputs/apk/proot/release/*.apk; do
-            out="dist/localai-agent-0.2.4-proot-${{ matrix.name }}-ci.apk"
+            ver="$("$BT/aapt" dump badging "$apk" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+            out="dist/localai-agent-${ver}-proot-${{ matrix.name }}-ci.apk"
             "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
               --out "$out" "$apk"
             "$BT/apksigner" verify "$out"
