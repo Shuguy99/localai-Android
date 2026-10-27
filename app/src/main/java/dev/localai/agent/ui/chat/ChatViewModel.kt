@@ -10,6 +10,7 @@ import dev.localai.agent.data.settings.AppSettings
 import dev.localai.agent.inference.EngineState
 import dev.localai.agent.service.RuntimeForegroundService
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,6 +30,12 @@ data class ChatMessage(
     val toolStatus: ToolStatus? = null,
 )
 
+/** A shell command waiting for the user's allow/deny decision. */
+data class PendingCommand(
+    val id: String,
+    val command: String,
+)
+
 data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),
     val input: String = "",
@@ -40,6 +47,7 @@ data class ChatUiState(
     val selectedModelPath: String? = null,
     val settings: AppSettings = AppSettings(),
     val error: String? = null,
+    val pendingCommand: PendingCommand? = null,
 )
 
 class ChatViewModel(private val app: AppContainer) : ViewModel() {
@@ -53,6 +61,10 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
     private var activeAssistantId: String? = null
 
     private var serviceHeld = false
+
+    /** Resolved by [allowCommand] / [denyCommand]; awaited inside confirmCommand. */
+    @Volatile
+    private var pendingConfirm: CompletableDeferred<Boolean>? = null
 
     init {
         viewModelScope.launch {
@@ -173,6 +185,25 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
                         )
                     }
                 }
+
+                override suspend fun confirmCommand(command: String): Boolean {
+                    val deferred = CompletableDeferred<Boolean>()
+                    pendingConfirm = deferred
+                    _state.update {
+                        it.copy(
+                            pendingCommand = PendingCommand(
+                                id = "c-${System.nanoTime()}",
+                                command = command,
+                            ),
+                        )
+                    }
+                    try {
+                        return deferred.await()
+                    } finally {
+                        pendingConfirm = null
+                        _state.update { it.copy(pendingCommand = null) }
+                    }
+                }
             }
 
             val result = try {
@@ -198,6 +229,16 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
     fun stop() {
         // Cancels the native sampler and any container process owned by the turn.
         app.runtime.cancel()
+        // A command waiting for approval must not block a stopped turn forever.
+        resolvePending(false)
+    }
+
+    fun allowCommand() = resolvePending(true)
+
+    fun denyCommand() = resolvePending(false)
+
+    private fun resolvePending(allowed: Boolean) {
+        pendingConfirm?.complete(allowed)
     }
 
     fun newChat() {
@@ -248,6 +289,7 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
 
     override fun onCleared() {
         app.runtime.cancel()
+        resolvePending(false)
         if (serviceHeld) {
             serviceHeld = false
             RuntimeForegroundService.release(app.appContext, SERVICE_KEY)

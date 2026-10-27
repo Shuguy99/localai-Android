@@ -23,11 +23,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.AddComment
 import androidx.compose.material.icons.outlined.Stop
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -137,6 +139,14 @@ fun ChatScreen(
             }
         }
 
+        state.pendingCommand?.let { pending ->
+            CommandApprovalCard(
+                pending = pending,
+                onAllow = vm::allowCommand,
+                onDeny = vm::denyCommand,
+            )
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth().padding(10.dp),
             verticalAlignment = Alignment.Bottom,
@@ -178,6 +188,49 @@ fun ChatScreen(
                         tint = MaterialTheme.colorScheme.onPrimary,
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CommandApprovalCard(
+    pending: PendingCommand,
+    onAllow: () -> Unit,
+    onDeny: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                "The agent wants to run this command",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Surface(
+                color = MaterialTheme.colorScheme.surface,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    pending.command.take(1200),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.padding(8.dp),
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = onAllow) { Text("Allow") }
+                OutlinedButton(onClick = onDeny) { Text("Deny") }
+                Text(
+                    "read-only commands run without asking",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.weight(1f),
+                )
             }
         }
     }

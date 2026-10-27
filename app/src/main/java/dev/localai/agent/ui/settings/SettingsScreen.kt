@@ -248,6 +248,11 @@ fun SettingsScreen(
                     onChange = { v -> vm.updateContainer { it.copy(snapshotEnabled = v) } },
                 )
                 SwitchRow(
+                    label = "Ask before shell commands that are not read-only",
+                    checked = container.confirmShellCommands,
+                    onChange = { v -> vm.updateContainer { it.copy(confirmShellCommands = v) } },
+                )
+                SwitchRow(
                     label = "Simulated root (-0)",
                     checked = container.simulatedRoot,
                     onChange = { v -> vm.updateContainer { it.copy(simulatedRoot = v) } },

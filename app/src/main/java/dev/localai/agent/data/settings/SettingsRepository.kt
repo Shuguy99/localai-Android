@@ -64,6 +64,8 @@ data class ContainerSettings(
     val memoryLimitMb: Int = 0, // 0 = unlimited (ulimit not applied)
     val noSeccomp: Boolean = false,
     val exposeSharedStorage: Boolean = false,
+    /** Ask the user before shell commands that are not provably read-only. */
+    val confirmShellCommands: Boolean = true,
 )
 
 data class AppSettings(
@@ -149,6 +151,7 @@ class SettingsRepository(private val context: Context) {
         val MEMORY_LIMIT = intPreferencesKey("container.memory_limit")
         val NO_SECCOMP = booleanPreferencesKey("container.no_seccomp")
         val EXPOSE_STORAGE = booleanPreferencesKey("container.expose_storage")
+        val CONFIRM_SHELL = booleanPreferencesKey("container.confirm_shell")
 
         val SELECTED_MODEL_PATH = stringPreferencesKey("model.selected_path")
         val SELECTED_MODEL_NAME = stringPreferencesKey("model.selected_name")
@@ -186,6 +189,7 @@ class SettingsRepository(private val context: Context) {
             memoryLimitMb = this[Keys.MEMORY_LIMIT] ?: cdefaults.memoryLimitMb,
             noSeccomp = this[Keys.NO_SECCOMP] ?: cdefaults.noSeccomp,
             exposeSharedStorage = this[Keys.EXPOSE_STORAGE] ?: cdefaults.exposeSharedStorage,
+            confirmShellCommands = this[Keys.CONFIRM_SHELL] ?: cdefaults.confirmShellCommands,
         )
         return AppSettings(
             model = model,
@@ -221,6 +225,7 @@ class SettingsRepository(private val context: Context) {
         this[Keys.MEMORY_LIMIT] = c.memoryLimitMb
         this[Keys.NO_SECCOMP] = c.noSeccomp
         this[Keys.EXPOSE_STORAGE] = c.exposeSharedStorage
+        this[Keys.CONFIRM_SHELL] = c.confirmShellCommands
     }
 }
 

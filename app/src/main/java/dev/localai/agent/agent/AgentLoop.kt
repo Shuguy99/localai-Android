@@ -11,6 +11,7 @@ import dev.localai.agent.inference.GenerationResult
 import dev.localai.agent.inference.LlamaEngine
 import dev.localai.agent.inference.ModelInfo
 import kotlinx.coroutines.flow.first
+import kotlinx.serialization.json.JsonPrimitive
 import java.util.UUID
 
 data class TurnResult(
@@ -27,6 +28,13 @@ interface AgentListener {
     fun onToolStarted(id: String, name: String, argumentsPreview: String)
     fun onToolFinished(id: String, name: String, ok: Boolean, outputPreview: String)
     fun onNotice(text: String)
+
+    /**
+     * Called before a shell command that [CommandRisk] classified as needing
+     * approval. Suspends until the user answers; false declines the command and
+     * the observation tells the model to try something else.
+     */
+    suspend fun confirmCommand(command: String): Boolean = true
 }
 
 /**
@@ -110,7 +118,24 @@ class AgentLoop(
 
                     val id = UUID.randomUUID().toString().take(8)
                     listener.onToolStarted(id, call.name, preview(call))
-                    val toolResult = tools.execute(call, settings.container)
+                    val toolResult = if (call.name == "exec_shell" &&
+                        settings.container.confirmShellCommands
+                    ) {
+                        val command = (call.arguments["command"] as? JsonPrimitive)?.content.orEmpty()
+                        if (CommandRisk.classify(command) == CommandRisk.Risk.CONFIRM &&
+                            !listener.confirmCommand(command)
+                        ) {
+                            ToolResult(
+                                false,
+                                "declined: the user chose not to run this command. " +
+                                    "Ask what to do differently or propose a safer approach.",
+                            )
+                        } else {
+                            tools.execute(call, settings.container)
+                        }
+                    } else {
+                        tools.execute(call, settings.container)
+                    }
                     val output = toolResult.output.take(MAX_OBSERVATION)
                     listener.onToolFinished(id, call.name, toolResult.ok, output)
 
