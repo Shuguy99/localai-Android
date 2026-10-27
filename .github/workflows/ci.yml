@@ -63,8 +63,17 @@ jobs:
       - name: Fetch pinned native deps (llama.cpp, PRoot, Alpine)
         run: bash scripts/fetch_deps.sh
 
+      # AGP does not auto-install non-default CMake versions; hosted runners
+      # only preinstall 3.22.1, and the project needs 3.31.1 (FindVulkan glslc).
+      - name: Install CMake 3.31.1
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: >
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME"
+          "cmake;3.31.1" > /dev/null
+
       # The hosted runner has the Android SDK with accepted licenses; AGP
-      # auto-installs the pinned NDK 27.0.12077973 and CMake 3.22.1 on first use.
+      # auto-installs the pinned NDK 27.0.12077973 on first use.
       - name: Build proot release APK
         run: >
           ./gradlew assembleProotRelease

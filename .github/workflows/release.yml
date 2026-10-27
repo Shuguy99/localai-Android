@@ -57,10 +57,22 @@ jobs:
           EOF
           chmod 600 "$HOME/.localai-release/"*
 
-      - name: Build proot release APK (Vulkan enabled)
+      # AGP does not auto-install non-default CMake versions; hosted runners
+      # only preinstall 3.22.1, and the project needs 3.31.1 (FindVulkan glslc).
+      - name: Install CMake 3.31.1
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
         run: >
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME"
+          "cmake;3.31.1" > /dev/null
+
+      - name: Build proot release APK (Vulkan enabled)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        # The SDK CMake's bundled ninja must be on PATH for the host-side
+        # vulkan-shaders-gen ExternalProject.
+        run: >
+          PATH="$ANDROID_HOME/cmake/3.31.1/bin:$PATH"
           ./gradlew assembleProotRelease
           -PllamaVulkan=true
           -x lintVitalProotRelease
