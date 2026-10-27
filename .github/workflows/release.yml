@@ -4,6 +4,11 @@ on:
   push:
     tags: ['v*']
 
+# The default GITHUB_TOKEN is read-only; attaching APKs to a Release needs
+# contents:write (release creation + asset upload).
+permissions:
+  contents: write
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
