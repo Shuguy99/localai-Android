@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.3 — 2026-10-27
+
+Container quality pass: the shell you talk to now behaves like a real terminal.
+
+### Added
+
+- **Persistent shell session**: `exec_shell` (and the Container tab) now runs in a
+  long-lived PRoot shell instead of spawning a fresh `sh -lc` for every command.
+  The 150-300 ms ptrace startup disappears from every command after the first, and
+  state survives between commands — `cd`, `export`, `umask`, aliases all persist,
+  exactly like sitting in a terminal. The session is recreated transparently after
+  a timeout, a Stop, a container reset, or 10 minutes of idleness. If the session
+  shell dies mid-command, the command is reported as failed (never retried
+  silently) and the next command starts a fresh session. The legacy one-shot path
+  remains as an automatic fallback for hosts where the session protocol cannot
+  start (no busybox `base64`). Commands travel base64-encoded with per-command
+  random sentinels, so guest output can never desynchronize the protocol.
+- **Honest rootfs install progress**: the installer scans the bundled tarball once
+  to count entries, then reports real `1234 / 3801 entries` fractions. The old bar
+  cycled 0→100% every 5000 files, which for the ~3.8k-entry Alpine minirootfs
+  meant it never once showed a truthful value.
+- **Persistent apk package cache**: a host-side directory is bind-mounted over
+  `/etc/apk/cache`, so every package `apk add` downloads survives container
+  resets and app restarts. Rebuilding a reset container installs previously used
+  packages from local storage instead of re-downloading them.
+- **Community repository enabled**: `/etc/apk/repositories` now lists the
+  `v3.20/community` mirror next to `main`, so packages that live there (many CLI
+  tools do) install without editing the file by hand.
+
+### Changed
+
+- **Snapshot create/restore no longer forces `workdir=/`**; the flag was already
+  meaningless there (both commands operate with `tar -C /workspace`) and it now
+  keeps the persistent session in the agent's working directory.
+
+### Notes
+
+- **Release signature changed**: the 0.2.3 APKs are signed with a new key because
+  the previous signing keystore was lost with the old build machine. Install
+  0.2.3 over 0.2.2 requires uninstalling the old version first (Android rejects
+  signature mismatches). Save your `/workspace` and `/shared` files before
+  uninstalling; the model files in the app's external files dir also need to be
+  re-imported. Future releases will keep this key.
+- 67/67 JVM unit tests green (7 new: shell protocol, session protocol against an
+  in-JVM fake shell, output cap).
+
 ## 0.2.2 — 2026-10-26
 
 Bug-fix pass over the whole codebase: one native correctness fix, one safety fix in
