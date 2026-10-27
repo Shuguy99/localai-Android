@@ -6,7 +6,9 @@ import dev.localai.agent.AppContainer
 import dev.localai.agent.data.hf.HfException
 import dev.localai.agent.data.hf.HfFile
 import dev.localai.agent.data.hf.HfModel
+import dev.localai.agent.data.hf.HfShardGroup
 import dev.localai.agent.data.model.DownloadEvent
+import dev.localai.agent.data.model.GgufShards
 import dev.localai.agent.data.model.InstalledModel
 import dev.localai.agent.data.model.MemoryGuard
 import dev.localai.agent.data.model.ModelSidecar
@@ -46,6 +48,7 @@ data class ModelsUiState(
     val selected: HfModel? = null,
     val loadingDetails: Boolean = false,
     val files: List<HfFile> = emptyList(),
+    val shardGroups: List<HfShardGroup> = emptyList(),
     val downloads: Map<String, DownloadUi> = emptyMap(),
     val installed: List<InstalledModel> = emptyList(),
     val engineState: EngineState = EngineState.Unloaded,
@@ -163,12 +166,13 @@ class ModelsViewModel(private val app: AppContainer) : ViewModel() {
                     quant = HfModel.quantLabel(it.rfilename),
                 )
             }
-            _state.update { it.copy(loadingDetails = false, files = files) }
+            val groups = details.ggufShardGroups(details.repoId)
+            _state.update { it.copy(loadingDetails = false, files = files, shardGroups = groups) }
         }
     }
 
     fun closeSelection() {
-        _state.update { it.copy(selected = null, files = emptyList(), loadingDetails = false) }
+        _state.update { it.copy(selected = null, files = emptyList(), shardGroups = emptyList(), loadingDetails = false) }
     }
 
     fun download(file: HfFile) {
@@ -241,6 +245,92 @@ class ModelsViewModel(private val app: AppContainer) : ViewModel() {
         }
     }
 
+    /**
+     * Downloads a complete shard group part by part (each with its own resume),
+     * aggregating progress across parts. llama.cpp later loads the -00001-
+     * part and finds the siblings in the same directory.
+     */
+    fun downloadShardGroup(group: HfShardGroup) {
+        val key = "shard:${group.modelId}/${group.baseName}"
+        if (downloadJobs[key]?.isActive == true) return
+        val label = "${group.baseName} (${group.partCount} parts)"
+        _state.update {
+            it.copy(downloads = it.downloads + (key to DownloadUi(key, label, total = group.totalSize ?: -1)))
+        }
+        RuntimeForegroundService.acquire(app.appContext, downloadKey(key))
+        downloadJobs[key] = viewModelScope.launch {
+            try {
+                var completedBytes = 0L
+                val grandTotal = group.totalSize
+                for (part in group.parts) {
+                    var announced = false
+                    app.downloader.download(group.modelId, part.rfilename, part.effectiveSize).collect { event ->
+                        when (event) {
+                            is DownloadEvent.Progress -> _state.update { s ->
+                                val d = s.downloads[key] ?: return@update s
+                                s.copy(downloads = s.downloads + (key to d.copy(
+                                    bytes = completedBytes + event.bytes,
+                                    total = grandTotal ?: (completedBytes + event.totalBytes),
+                                    message = if (announced) d.message
+                                    else "${group.baseName}: part ${part.rfilename.substringAfterLast('-')}…".also { announced = true },
+                                )))
+                            }
+                            DownloadEvent.Verifying -> _state.update { s ->
+                                val d = s.downloads[key] ?: return@update s
+                                s.copy(downloads = s.downloads + (key to d.copy(
+                                    message = "Verifying ${part.rfilename.substringAfterLast('/')}…",
+                                )))
+                            }
+                            is DownloadEvent.Done -> {
+                                completedBytes += event.bytes
+                                withContext(Dispatchers.IO) {
+                                    app.modelStore.writeSidecar(
+                                        event.file,
+                                        ModelSidecar(
+                                            repoId = group.modelId,
+                                            fileName = part.rfilename,
+                                            quant = group.quant,
+                                            sizeBytes = event.bytes,
+                                            downloadedAt = System.currentTimeMillis(),
+                                        ),
+                                    )
+                                }
+                                _state.update { s ->
+                                    val d = s.downloads[key] ?: return@update s
+                                    s.copy(downloads = s.downloads + (key to d.copy(bytes = completedBytes)))
+                                }
+                            }
+                        }
+                    }
+                }
+                _state.update { s ->
+                    val d = s.downloads[key] ?: return@update s
+                    s.copy(downloads = s.downloads + (key to d.copy(
+                        status = DownloadStatus.DONE,
+                        message = null,
+                    )))
+                }
+                refreshInstalled()
+            } catch (e: CancellationException) {
+                _state.update { s -> s.copy(downloads = s.downloads - key) }
+                throw e
+            } catch (e: Exception) {
+                _state.update { s ->
+                    val d = s.downloads[key] ?: DownloadUi(key, label)
+                    s.copy(
+                        downloads = s.downloads + (key to d.copy(
+                            status = DownloadStatus.FAILED,
+                            message = e.message ?: "Download failed",
+                        )),
+                    )
+                }
+            } finally {
+                downloadJobs.remove(key)
+                RuntimeForegroundService.release(app.appContext, downloadKey(key))
+            }
+        }
+    }
+
     fun cancelDownload(key: String) {
         downloadJobs[key]?.cancel()
         downloadJobs.remove(key)
@@ -258,11 +348,14 @@ class ModelsViewModel(private val app: AppContainer) : ViewModel() {
                 _state.update { it.copy(error = "Model file is missing: $path") }
                 return@launch
             }
+            // A sharded model weighs the SUM of its parts, not just shard 1.
+            val weightsOverride = withContext(Dispatchers.IO) { shardTotalBytes(file) }
             val estimate = withContext(Dispatchers.IO) {
                 app.memoryGuard.estimate(
                     file,
                     _state.value.settings.model.contextSize,
                     _state.value.settings.model.kvCacheQ8,
+                    weightsBytesOverride = weightsOverride,
                 )
             }
             if (estimate.level == MemoryGuard.Estimate.Level.OK) {
@@ -271,6 +364,15 @@ class ModelsViewModel(private val app: AppContainer) : ViewModel() {
                 _state.update { it.copy(memoryEstimate = estimate, pendingLoadPath = path) }
             }
         }
+    }
+
+    /** Sum of the shard group's part sizes when [file] is a -00001- shard, else null. */
+    private fun shardTotalBytes(firstShard: File): Long? {
+        val part = GgufShards.parse(firstShard.name) ?: return null
+        val siblings = firstShard.parentFile?.listFiles { f ->
+            f.isFile && GgufShards.parse(f.name)?.base == part.base
+        }.orEmpty()
+        return siblings.takeIf { it.size >= part.total }?.sumOf { it.length() }
     }
 
     fun confirmPendingLoad() {

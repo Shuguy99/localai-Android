@@ -45,14 +45,20 @@ class MemoryGuard(context: Context) {
             }
     }
 
-    fun estimate(modelFile: File, contextSize: Int, kvQ8: Boolean = true): Estimate {
+    fun estimate(
+        modelFile: File,
+        contextSize: Int,
+        kvQ8: Boolean = true,
+        weightsBytesOverride: Long? = null,
+    ): Estimate {
         val info = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(info)
         val available = info.availMem.coerceAtLeast(1L)
         val totalRam = info.totalMem.coerceAtLeast(1L)
 
         val meta = metaReader.read(modelFile)
-        val weights = (modelFile.length() * 1.02).toLong() + RUNTIME_OVERHEAD_BYTES
+        val onDisk = weightsBytesOverride ?: modelFile.length()
+        val weights = (onDisk * 1.02).toLong() + RUNTIME_OVERHEAD_BYTES
 
         // Local copies: Meta.kvHeads has a custom getter, which blocks smart casts.
         val blockCount = meta?.blockCount

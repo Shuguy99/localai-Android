@@ -35,8 +35,8 @@ android {
         applicationId = "dev.localai.agent"
         minSdk = 28
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.2.4"
+        versionCode = 7
+        versionName = "0.3.0"
 
         // ARM64 only: every shipping 2B-4B device we support is arm64-v8a.
         ndk {
@@ -101,7 +101,10 @@ android {
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+            // 3.31.1: FindVulkan gained the glslc component in 3.24; ggml-vulkan
+            // needs Vulkan_GLSLC_EXECUTABLE when GGML_VULKAN=ON. AGP downloads
+            // this CMake from the SDK on first use (licenses must be accepted).
+            version = "3.31.1"
         }
     }
 

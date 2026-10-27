@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-apk:
+    name: Release APK (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: portable
+            gradle-args: ''
+          - name: perf
+            # dotprod ISAs only exist on ARMv8.2+; the portable variant is the default.
+            gradle-args: '-PllamaArmArch=armv8.2-a+dotprod'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # llama.cpp, PRoot and the Alpine rootfs are intentionally not committed
+      # (see .gitignore); fetch the pinned versions with checksum verification.
+      - name: Fetch pinned native deps (llama.cpp, PRoot, Alpine)
+        run: bash scripts/fetch_deps.sh
+
+      # Release signing material lives in repository secrets; it is written to
+      # the well-known location that app/build.gradle.kts reads. The keystore
+      # never appears in logs or artifacts.
+      - name: Restore release keystore from secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          mkdir -p "$HOME/.localai-release"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$HOME/.localai-release/release.keystore"
+          cat > "$HOME/.localai-release/keystore.properties" <<EOF
+          storeFile=$HOME/.localai-release/release.keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+          chmod 600 "$HOME/.localai-release/"*
+
+      - name: Build proot release APK (Vulkan enabled)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: >
+          ./gradlew assembleProotRelease
+          -PllamaVulkan=true
+          -x lintVitalProotRelease
+          --stacktrace
+          ${{ matrix.gradle-args }}
+
+      - name: Collect signed APKs
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)"
+          mkdir -p dist
+          for apk in app/build/outputs/apk/proot/release/*.apk; do
+            ver="$("$BT/aapt" dump badging "$apk" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+            out="dist/localai-agent-${ver}-proot-${{ matrix.name }}.apk"
+            cp "$apk" "$out"
+            "$BT/apksigner" verify "$out"
+            echo "signed: $out"
+          done
+
+      - name: Extract release notes
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          awk -v ver="## $VER" '
+            $0 ~ ver {flag=1; next}
+            /^## / && flag {exit}
+            flag {print}
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md for the full list of changes." > notes.md
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk-${{ matrix.name }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          body_path: notes.md
+          fail_on_unmatched_files: true

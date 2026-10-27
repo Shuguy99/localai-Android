@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import dev.localai.agent.agent.AgentRuntime
 import dev.localai.agent.container.ContainerManager
+import dev.localai.agent.data.chat.ChatStore
 import dev.localai.agent.data.hf.HuggingFaceApi
 import dev.localai.agent.data.model.MemoryGuard
 import dev.localai.agent.data.model.ModelDownloader
@@ -34,6 +35,7 @@ class AppContainer(context: Context) {
     val modelStore = ModelStore(appContext)
     val downloader = ModelDownloader(http, hf, modelStore)
     val memoryGuard = MemoryGuard(appContext)
+    val chatStore = ChatStore(java.io.File(appContext.filesDir, "chats"))
 
     val engine = LlamaEngine()
     val container = ContainerManager(appContext).also { it.refresh() }

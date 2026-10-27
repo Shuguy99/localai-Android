@@ -45,10 +45,33 @@ data class HfModel(
         .filter { it.rfilename.endsWith(".gguf", ignoreCase = true) }
         // Projection files are GGUF too but cannot be loaded on their own.
         .filter { !it.rfilename.contains("mmproj", ignoreCase = true) }
-        // Sharded GGUFs need every shard at the same time; keep the MVP honest instead
-        // of silently downloading a model that cannot load.
+        // Shards are offered separately through [ggufShardGroups].
         .filter { !SHARD_PATTERN.containsMatchIn(it.rfilename) }
         .sortedBy { it.effectiveSize ?: Long.MAX_VALUE }
+
+    /**
+     * Complete shard groups (`model-00001-of-00003.gguf` …) that can be
+     * downloaded as one model: every part from 1..N present in the repo.
+     * Groups are keyed/sorted by base name; the first part is what llama.cpp
+     * gets pointed at — it discovers the siblings automatically.
+     */
+    fun ggufShardGroups(repoId: String = ""): List<HfShardGroup> {
+        val shardNames = siblings
+            .filter { it.rfilename.endsWith(".gguf", ignoreCase = true) }
+            .filter { !it.rfilename.contains("mmproj", ignoreCase = true) }
+            .map { it.rfilename }
+        val grouped = dev.localai.agent.data.model.GgufShards.groupRemote(shardNames)
+        val byName = siblings.associateBy { it.rfilename }
+        return grouped.map { (base, names) ->
+            val parts = names.mapNotNull { byName[it] }
+            HfShardGroup(
+                modelId = repoId,
+                baseName = base,
+                parts = parts,
+                totalSize = parts.map { it.effectiveSize }.filterNotNull().takeIf { it.size == parts.size }?.sum(),
+            )
+        }.sortedBy { it.baseName }
+    }
 
     companion object {
         private val SHARD_PATTERN = Regex("""-\d{5}-of-\d{5}\.gguf$""", RegexOption.IGNORE_CASE)
@@ -71,3 +94,15 @@ data class HfFile(
     val size: Long?,
     val quant: String,
 )
+
+/** A complete `-NNNNN-of-NNNNN` shard set from one repo, downloadable as one model. */
+data class HfShardGroup(
+    val modelId: String,
+    val baseName: String,
+    val parts: List<HfSibling>,
+    val totalSize: Long?,
+) {
+    val partCount: Int get() = parts.size
+    val firstFile: String get() = parts.first().rfilename
+    val quant: String get() = HfModel.quantLabel(baseName)
+}

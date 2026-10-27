@@ -45,6 +45,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.localai.agent.data.hf.HfFile
 import dev.localai.agent.data.hf.HfModel
+import dev.localai.agent.data.hf.HfShardGroup
 import dev.localai.agent.data.model.InstalledModel
 import dev.localai.agent.data.model.MemoryGuard
 import dev.localai.agent.inference.EngineState
@@ -139,10 +140,20 @@ fun ModelsScreen(
                         onDismiss = { vm.dismissDownload("${file.modelId}/${file.fileName}") },
                     )
                 }
-                if (!state.loadingDetails && state.files.isEmpty()) {
+                items(state.shardGroups, key = { "shard:" + it.modelId + "/" + it.baseName }) { group ->
+                    ShardGroupRow(
+                        group = group,
+                        download = state.downloads["shard:${group.modelId}/${group.baseName}"],
+                        ramLevel = vm.remoteFileLevel(group.totalSize),
+                        onDownload = { vm.downloadShardGroup(group) },
+                        onCancel = { vm.cancelDownload("shard:${group.modelId}/${group.baseName}") },
+                        onDismiss = { vm.dismissDownload("shard:${group.modelId}/${group.baseName}") },
+                    )
+                }
+                if (!state.loadingDetails && state.files.isEmpty() && state.shardGroups.isEmpty()) {
                     item {
                         Text(
-                            "No single-file GGUF found in this repo (sharded models are skipped).",
+                            "No loadable GGUF found in this repo.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -370,6 +381,89 @@ private fun FileRow(
             if (download?.status == DownloadStatus.DONE) {
                 Text(
                     "Downloaded and verified (GGUF magic + size).",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShardGroupRow(
+    group: HfShardGroup,
+    download: DownloadUi?,
+    ramLevel: MemoryGuard.Estimate.Level?,
+    onDownload: () -> Unit,
+    onCancel: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Card {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Badge(group.quant)
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        group.baseName,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${group.partCount} parts" + (group.totalSize?.let { ", ${formatBytes(it)} total" } ?: ""),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                ramLevel?.let { level ->
+                    val (label, color) = when (level) {
+                        MemoryGuard.Estimate.Level.OK -> "fits" to MaterialTheme.colorScheme.primary
+                        MemoryGuard.Estimate.Level.WARN -> "tight" to MaterialTheme.colorScheme.secondary
+                        MemoryGuard.Estimate.Level.DANGER -> "risky" to MaterialTheme.colorScheme.error
+                    }
+                    Badge(label, color)
+                    Spacer(Modifier.width(6.dp))
+                }
+                when (download?.status) {
+                    DownloadStatus.RUNNING -> IconButton(onClick = onCancel) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    }
+                    DownloadStatus.DONE -> TextButton(onClick = onDismiss) { Text("Done") }
+                    DownloadStatus.FAILED -> TextButton(onClick = onDownload) { Text("Retry") }
+                    null -> IconButton(onClick = onDownload) {
+                        Icon(Icons.Outlined.Download, contentDescription = "Download shards")
+                    }
+                }
+            }
+            if (download != null && download.status == DownloadStatus.RUNNING) {
+                if (download.progress != null) {
+                    LinearProgressIndicator(
+                        progress = { download.progress ?: 0f },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "${formatBytes(download.bytes)} / ${formatBytes(download.total)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                download.message?.let {
+                    Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                }
+            }
+            if (download?.status == DownloadStatus.FAILED) {
+                Text(
+                    download.message ?: "Download failed",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (download?.status == DownloadStatus.DONE) {
+                Text(
+                    "All parts downloaded; loads from the first shard.",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary,
                 )

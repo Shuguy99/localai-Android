@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Fetches the three non-source dependencies. Idempotent; set FORCE=1 to redownload.
+# Fetches the non-source dependencies. Idempotent; set FORCE=1 to redownload.
 #
-#   llama.cpp    v0.7.0 (pinned; the JNI layer is written against this API)
-#   PRoot        v5.3.0 static aarch64 (upstream, supports -0 and --link2symlink)
-#   Alpine       v3.20.3 minirootfs (~3.8 MB)
+#   llama.cpp      v0.7.0 (pinned; the JNI layer is written against this API)
+#   PRoot          v5.3.0 static aarch64 (upstream, supports -0 and --link2symlink)
+#   Alpine         v3.20.3 minirootfs (~3.8 MB)
+#   SPIRV-Headers  vulkan-sdk-1.4.335.0 (needed only for Vulkan builds)
+#   Vulkan-Headers vulkan-sdk-1.4.335.0 (vulkan.hpp; needed only for Vulkan builds)
 #
 # Everything lands inside the project; no root, no Android SDK writes.
 set -euo pipefail
@@ -11,11 +13,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_REF="${LLAMA_REF:-v0.7.0}"
 PROOT_VERSION="${PROOT_VERSION:-v5.3.0}"
+SPIRV_HEADERS_REF="${SPIRV_HEADERS_REF:-vulkan-sdk-1.4.335.0}"
+VULKAN_HEADERS_REF="${VULKAN_HEADERS_REF:-vulkan-sdk-1.4.335.0}"
 ALPINE_VERSION="${ALPINE_VERSION:-3.20.3}"
 
 CPP_DIR="$ROOT/app/src/main/cpp/llama.cpp"
 PROOT_DIR="$ROOT/app/src/proot/jniLibs/arm64-v8a"
 ASSET_DIR="$ROOT/app/src/proot/assets/rootfs"
+SPIRV_DIR="$ROOT/app/src/main/cpp/spirv-headers"
+VULKAN_HEADERS_DIR="$ROOT/app/src/main/cpp/vulkan-headers"
 
 FORCE="${FORCE:-0}"
 
@@ -31,7 +37,7 @@ need curl
 need tar
 need sha256sum
 
-mkdir -p "$CPP_DIR" "$PROOT_DIR" "$ASSET_DIR"
+mkdir -p "$CPP_DIR" "$PROOT_DIR" "$ASSET_DIR" "$SPIRV_DIR" "$VULKAN_HEADERS_DIR"
 
 # ---------------------------------------------------------------- llama.cpp
 if [ "$FORCE" = "1" ] || [ ! -f "$CPP_DIR/CMakeLists.txt" ]; then
@@ -79,6 +85,48 @@ if [ "$FORCE" = "1" ] || [ ! -f "$ALPINE_DEST" ]; then
     log "Alpine rootfs ready at app/src/proot/assets/rootfs/alpine-aarch64.tar.gz"
 else
     log "Alpine rootfs already present (FORCE=1 to refresh)"
+fi
+
+# ---------------------------------------------------------------- SPIRV-Headers
+# Required by ggml-vulkan's find_package(SPIRV-Headers CONFIG REQUIRED) when
+# GGML_VULKAN=ON. Header-only; our CMakeLists ships a matching package config.
+SPIRV_URL="https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/${SPIRV_HEADERS_REF}.tar.gz"
+SPIRV_SHA="1c47ca6342ebe86f57b46b8dbeb266fa655a1ca8e10d07e45370ff2d9c36312e"
+
+if [ "$FORCE" = "1" ] || [ ! -f "$SPIRV_DIR/include/spirv/unified1/spirv.hpp" ]; then
+    log "Downloading SPIRV-Headers ${SPIRV_HEADERS_REF}"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    curl -fsSL "$SPIRV_URL" -o "$tmp/spirv-headers.tar.gz"
+    echo "$SPIRV_SHA  $tmp/spirv-headers.tar.gz" | sha256sum -c - \
+        || die "SPIRV-Headers checksum mismatch."
+    rm -rf "$SPIRV_DIR"
+    mkdir -p "$SPIRV_DIR"
+    tar xzf "$tmp/spirv-headers.tar.gz" -C "$SPIRV_DIR" --strip-components=1
+    log "SPIRV-Headers ready at app/src/main/cpp/spirv-headers"
+else
+    log "SPIRV-Headers already present (FORCE=1 to refresh)"
+fi
+
+# ---------------------------------------------------------------- Vulkan-Headers
+# ggml-vulkan compiles against the C++ bindings (vulkan/vulkan.hpp), which the
+# NDK sysroot does not ship. Needed only for GGML_VULKAN=ON builds.
+VH_URL="https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/${VULKAN_HEADERS_REF}.tar.gz"
+VH_SHA="269e95cc5138ea0a0d52fcb0ee19102add2560fedf5a43b1b5c17780c2775764"
+
+if [ "$FORCE" = "1" ] || [ ! -f "$VULKAN_HEADERS_DIR/include/vulkan/vulkan.hpp" ]; then
+    log "Downloading Vulkan-Headers ${VULKAN_HEADERS_REF}"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    curl -fsSL "$VH_URL" -o "$tmp/vulkan-headers.tar.gz"
+    echo "$VH_SHA  $tmp/vulkan-headers.tar.gz" | sha256sum -c - \
+        || die "Vulkan-Headers checksum mismatch."
+    rm -rf "$VULKAN_HEADERS_DIR"
+    mkdir -p "$VULKAN_HEADERS_DIR"
+    tar xzf "$tmp/vulkan-headers.tar.gz" -C "$VULKAN_HEADERS_DIR" --strip-components=1
+    log "Vulkan-Headers ready at app/src/main/cpp/vulkan-headers"
+else
+    log "Vulkan-Headers already present (FORCE=1 to refresh)"
 fi
 
 cat <<'EOF'

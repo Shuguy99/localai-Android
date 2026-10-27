@@ -6,11 +6,15 @@ import dev.localai.agent.AppContainer
 import dev.localai.agent.agent.AgentListener
 import dev.localai.agent.agent.ChatRole
 import dev.localai.agent.agent.ChatTurn
+import dev.localai.agent.data.chat.Conversation
+import dev.localai.agent.data.chat.StoredMessage
+import dev.localai.agent.data.chat.StoredTurn
 import dev.localai.agent.data.settings.AppSettings
 import dev.localai.agent.inference.EngineState
 import dev.localai.agent.service.RuntimeForegroundService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -48,6 +52,7 @@ data class ChatUiState(
     val settings: AppSettings = AppSettings(),
     val error: String? = null,
     val pendingCommand: PendingCommand? = null,
+    val conversationId: String? = null,
 )
 
 class ChatViewModel(private val app: AppContainer) : ViewModel() {
@@ -56,6 +61,12 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
     private val history = mutableListOf<ChatTurn>()
+
+    /** id of the persisted conversation; null until the first turn is saved. */
+    private var conversationId: String? = null
+
+    /** creation time of the persisted conversation, kept across saves. */
+    private var conversationCreatedAt: Long = 0L
 
     @Volatile
     private var activeAssistantId: String? = null
@@ -77,6 +88,9 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
                     )
                 }
             }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            restoreLatestConversation()
         }
         viewModelScope.launch {
             app.runtime.modelState.collect { engine ->
@@ -222,6 +236,7 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
                 history += ChatTurn(ChatRole.USER, text)
                 if (result.text.isNotBlank()) history += ChatTurn(ChatRole.ASSISTANT, result.text)
                 while (history.size > 24) history.removeAt(0)
+                persistConversation()
             }
         }
     }
@@ -243,9 +258,13 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
 
     fun newChat() {
         if (_state.value.generating) return
+        // Keep the outgoing conversation on disk before the reset wipes it.
+        if (conversationId != null && _state.value.messages.isNotEmpty()) persistConversation()
         history.clear()
+        conversationId = null
+        conversationCreatedAt = 0L
         activeAssistantId = null
-        _state.update { it.copy(messages = emptyList(), error = null, step = 0) }
+        _state.update { it.copy(messages = emptyList(), error = null, step = 0, conversationId = null) }
         // The old conversation's KV prefix is dead weight now; drop it so the
         // next request re-decodes from a clean cache.
         viewModelScope.launch { runCatching { app.runtime.resetConversation() } }
@@ -253,6 +272,61 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
 
     fun dismissError() {
         _state.update { it.copy(error = null) }
+    }
+
+    /** Persists the current conversation atomically (tmp + rename inside ChatStore). */
+    private fun persistConversation() {
+        val id = conversationId ?: app.chatStore.newId().also {
+            conversationId = it
+            conversationCreatedAt = System.currentTimeMillis()
+        }
+        val now = System.currentTimeMillis()
+        val messages = _state.value.messages
+        val firstUser = messages.firstOrNull { it.role == MessageRole.USER }?.text.orEmpty()
+        val conversation = Conversation(
+            id = id,
+            title = dev.localai.agent.data.chat.ChatStore.titleFrom(firstUser),
+            createdAt = if (conversationCreatedAt == 0L) now else conversationCreatedAt,
+            updatedAt = now,
+            turns = history.map { StoredTurn(it.role.name, it.content) },
+            messages = messages.filterNot { it.streaming }.map {
+                StoredMessage(
+                    role = it.role.name,
+                    text = it.text.take(ChatStoreMaxToolText),
+                    toolName = it.toolName,
+                    toolStatus = it.toolStatus?.name,
+                )
+            },
+        )
+        _state.update { it.copy(conversationId = id) }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { app.chatStore.save(conversation) }
+        }
+    }
+
+    /** Brings back the most recent conversation after process death. */
+    private fun restoreLatestConversation() {
+        val meta = runCatching { app.chatStore.list().firstOrNull() }.getOrNull() ?: return
+        val conv = runCatching { app.chatStore.load(meta.id) }.getOrNull() ?: return
+        conversationId = conv.id
+        conversationCreatedAt = conv.createdAt
+        val uiMessages = conv.messages.mapNotNull { stored ->
+            val role = runCatching { MessageRole.valueOf(stored.role) }.getOrNull() ?: return@mapNotNull null
+            ChatMessage(
+                id = "r-${stored.role.firstOrNull()}-${System.nanoTime()}",
+                role = role,
+                text = stored.text,
+                toolName = stored.toolName,
+                toolStatus = stored.toolStatus?.let { runCatching { ToolStatus.valueOf(it) }.getOrNull() },
+            )
+        }
+        val turns = conv.turns.mapNotNull { stored ->
+            val role = runCatching { ChatRole.valueOf(stored.role) }.getOrNull() ?: return@mapNotNull null
+            ChatTurn(role, stored.text)
+        }
+        history.clear()
+        history.addAll(turns)
+        _state.update { it.copy(messages = uiMessages, conversationId = conv.id) }
     }
 
     private fun startAssistant() {
@@ -299,5 +373,6 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
 
     private companion object {
         const val SERVICE_KEY = "model:chat"
+        const val ChatStoreMaxToolText = 4096
     }
 }

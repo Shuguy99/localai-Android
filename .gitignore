@@ -22,3 +22,5 @@ keystore.properties
 hs_err_pid*.log
 core.*
 *.hprof
+app/src/main/cpp/spirv-headers/
+app/src/main/cpp/vulkan-headers/

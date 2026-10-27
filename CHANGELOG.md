@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.3.0 — 2026-10-27
+
+Conversation persistence, sharded models and a real GPU backend: the three
+long-standing gaps from the README's known-limitations list are closed, plus
+releases now build and sign themselves on GitHub.
+
+### Added
+
+- **Chat history survives process death**: every completed turn is persisted
+  atomically to `filesDir/chats/<id>.json` (strict USER/ASSISTANT turns for the
+  prompt builder + the full UI transcript with tool calls and notices, tool
+  text capped at 4 KiB). The newest conversation is restored on app start, so
+  a killed process no longer wipes the dialogue. "New chat" keeps the outgoing
+  conversation on disk before resetting; the KV prefix cache is dropped as
+  before. Backed by a multi-conversation `ChatStore` (list/delete ready for a
+  history picker later).
+- **Sharded GGUF models** (`model-00001-of-00003.gguf`): previously skipped
+  entirely, now grouped, downloaded part-by-part (each part keeps resume
+  support) with one aggregated progress bar, stored with sidecars, shown as a
+  single installed model and deleted as a whole. llama.cpp loads shard 1 and
+  discovers the siblings automatically; the pre-load RAM estimate sums all
+  parts. Complete groups only — a repo missing a part is not offered.
+- **GPU offload via Vulkan**: release builds now ship the GGML Vulkan backend
+  (`-PllamaVulkan=true`), statically linked into `liblocalai.so` with all
+  shaders precompiled — no runtime shader compilation, no SDK needed on
+  device. Devices without a usable Vulkan driver simply keep running on CPU;
+  the existing "GPU layers" slider (Settings → Model) switches offload on.
+  Default remains CPU-only (0 layers) until the user opts in.
+- **Reproducible releases on GitHub**: the `Release` workflow builds portable
+  and perf APKs on every `v*` tag with Vulkan enabled, signs them with the
+  keystore stored in repository secrets and publishes the GitHub Release with
+  extracted CHANGELOG notes — signing material never sits on a sandbox disk.
+
+### Changed
+
+- `scripts/fetch_deps.sh` now fetches five pinned, checksum-verified
+  dependencies: llama.cpp, PRoot, Alpine rootfs, SPIRV-Headers and
+  Vulkan-Headers (the last two only matter for Vulkan builds).
+- CI builds moved from CMake 3.22.1 to 3.31.1 (FindVulkan's glslc component).
+- The local build machine lost its signing keystore in an environment reset;
+  0.3.0 starts a new signing key. **Upgrading from ≤ 0.2.4 requires uninstall
+  first**; 0.3.0 and later upgrade over each other cleanly. The new keystore
+  lives in GitHub Secrets, so this cannot happen again.
+
 ## 0.2.4 — 2026-10-27
 
 Trust and convenience pass: the agent asks before doing anything destructive,

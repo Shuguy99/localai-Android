@@ -27,10 +27,11 @@ container (simulated root, no host root required).
 
 | Area | Implementation |
 |---|---|
-| Inference | llama.cpp v0.7.0 via JNI, ARM64 CPU, mmap weights, persistent context with token-level KV prefix reuse, streaming tokens, cancellation, stop sequences, sampler chain (top-k/top-p/temp/penalties) |
+| Inference | llama.cpp v0.7.0 via JNI, ARM64 CPU + optional Vulkan GPU offload (`-PllamaVulkan=true`, shaders precompiled), mmap weights, persistent context with token-level KV prefix reuse, streaming tokens, cancellation, stop sequences, sampler chain (top-k/top-p/temp/penalties) |
 | Prompting | Kotlin chat templates: ChatML/Qwen, Llama 3, Gemma, Mistral, Phi-3 + AUTO detection and manual override |
 | Model discovery | `GET /api/models?search=…&filter=gguf&full=true`, detail lookup with `blobs=true` for file sizes |
-| Downloads | Resumable `Range` downloads, `.part` files, progress flow, free-space check, GGUF magic + size verification, gated/401/403 handling |
+| Downloads | Resumable `Range` downloads (single files and complete shard groups), `.part` files, progress flow, free-space check, GGUF magic + size verification, gated/401/403 handling |
+| Chat storage | Conversations persisted atomically per turn (`filesDir/chats/`), newest restored on start; strict turn view for the prompt builder + full UI transcript |
 | Container | PRoot + Alpine 3.20 minirootfs, `-0` simulated root, bind mounts, timeout, output cap, `ulimit -v`, per-turn `/workspace` snapshots with restore |
 | Agent | 4 tools (`read_file`, `write_file`, `list_dir`, `exec_shell`), strict JSON protocol, step limit, path jail, soft command deny-list, tool status in UI |
 | Settings | DataStore-backed model/container settings, reset-to-default, HF token in Android Keystore |
@@ -98,7 +99,7 @@ scripts/fetch_deps.sh                   pinned llama.cpp, PRoot, Alpine
 
 ## Build
 
-Requirements: Android Studio (or JDK 17 + Android SDK 35), NDK 27.0.12077973, CMake 3.22.1,
+Requirements: Android Studio (or JDK 17 + Android SDK 35), NDK 27.0.12077973, CMake 3.31.1,
 an ARM64 Android 10+ device. Host root is not required.
 
 ```bash
@@ -108,6 +109,24 @@ bash scripts/fetch_deps.sh          # pins llama.cpp v0.7.0, PRoot v5.3.0, Alpin
 # or
 ./gradlew assembleStandardDebug     # Play-compatible, container disabled
 ```
+
+**Vulkan build requirements.** Add `-PllamaVulkan=true` to ship the GGML Vulkan
+backend (release builds pass it by default through the Release workflow):
+
+```bash
+bash scripts/fetch_deps.sh   # also pins SPIRV-Headers + Vulkan-Headers for Vulkan builds
+PATH="$ANDROID_HOME/cmake/3.31.1/bin:$PATH" \
+  ./gradlew assembleProotRelease -PllamaVulkan=true
+```
+
+`app/src/main/cpp/CMakeLists.txt` handles the rest automatically: it copies the
+NDK's `glslc` (plus `libc++.so`) into a build-tree shim that also carries a
+generated `SPIRV-Headers` package config and a `glslangValidator` stub, because
+CMake ≥ 3.31 requires that component even though ggml-vulkan never uses it.
+The shim also normalizes glslc's "extension not supported" diagnostics so
+ggml-vulkan's feature detection stays correct on older NDK shader tools.
+A host `ninja` (or the SDK CMake's bundled one) must be on `PATH` for the
+`vulkan-shaders-gen` host tool.
 
 **Path caveat.** CMake treats `;` as a list separator, so a checkout whose absolute path
 contains a semicolon (for example `/home/me/project;backup`) fails native configuration with
@@ -204,17 +223,17 @@ Three independent levers, all applied in the 0.2.1 release builds:
    would crash with SIGILL. `+i8mm` can be appended for ARMv8.6 cores (2021+), but
    that build then requires those cores too.
 
-Not yet wired: Vulkan GPU offload (`-PllamaVulkan=true` needs a glslc-capable build
-image) — on-device decode for 2–4B quants is usually still CPU-bound, so the CPU
-tuning above is the reliable path for now.
+Vulkan GPU offload is wired into release builds since 0.3.0: `-PllamaVulkan=true`
+compiles the GGML Vulkan backend with precompiled SPIR-V shaders (see "Vulkan build
+requirements" under Build). On-device decode for 2–4B quants is usually still
+CPU-bound, so treat GPU offload as an experiment and compare with the CPU numbers.
 
 
 ## First run
 
 1. **Models** tab → search, e.g. `qwen2.5 coder 3b` or `llama 3.2 3b instruct`.
-2. Open a repo, pick a single-file GGUF. `Q4_K_M` is the recommended default for 4–8 GB
-   phones; `Q4_0`/`Q3_K_M` if RAM is tight. Sharded GGUFs are listed as unsupported in this
-   MVP.
+2. Open a repo, pick a single-file GGUF or a complete shard group. `Q4_K_M` is the
+   recommended default for 4–8 GB phones; `Q4_0`/`Q3_K_M` if RAM is tight.
 3. Download (resumable; survives going to background via the foreground service).
 4. Tap **Load**. If the pre-load estimate is above 50% of *available* RAM you get a warning
    with the numbers and an explicit “Load anyway”.
@@ -330,11 +349,12 @@ contained in the unbundled rootfs.
 
 ## Known limitations / next steps
 
-- Sharded GGUF files are skipped (single-file models only).
 - KV prefix reuse falls back to a full re-decode on SWA-style memories that refuse partial
   cache trims (correct, just slower for those architectures).
-- GPU offload is plumbed through `n_gpu_layers`, but the default build is CPU-only.
-- No chat history persistence beyond the process; settings do persist.
+- Vulkan GPU offload ships in release builds (`-PllamaVulkan=true`); devices without a
+  working Vulkan driver fall back to CPU automatically. Offload is off by default — set
+  "GPU layers" in Settings → Model to opt in.
+- The CI pipeline (unit-test job) builds CPU-only; only the Release workflow ships Vulkan.
 - The standard flavor cannot run the container by design (Android W^X).
 - `exec_shell` is not a security boundary against a malicious model; the snapshot and
   deny-list are recovery/safety tools, not a sandbox.
