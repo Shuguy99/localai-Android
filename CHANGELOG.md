@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.4 — 2026-10-27
+
+Trust and convenience pass: the agent asks before doing anything destructive,
+models are easier to pick, and the project now builds itself on every push.
+
+### Added
+
+- **Command approval in chat**: before `exec_shell` runs a command that is not
+  provably read-only, the turn pauses and shows the exact command with
+  Allow / Deny buttons. The classifier (`CommandRisk`) is quote-aware and
+  splits on `&&`, `||`, `;` and `|`: read-only pipelines (`ls | wc -l`,
+  `cd /workspace && cat f.txt`) run without friction, while anything that
+  writes, mutates, installs, touches the network or spawns a shell
+  (`rm`, `apk`, `wget`, `sh -c`, redirections, `$( )`, backticks, `find -delete`,
+  `sed`, `awk`, `git`, ...) asks first. Command substitution and redirections
+  inside *double* quotes are still detected — POSIX sh expands them there; only
+  single quotes count as literal. Denying feeds the model an observation telling
+  it to propose something safer; Stop/Deny also resolves a waiting turn. The
+  hard deny-list (fork bombs, `mkfs`, `dd of=/dev/…`) is unchanged and runs
+  before the approval step. Toggle: Settings → Container → "Ask before shell
+  commands that are not read-only" (on by default).
+- **Featured models on the Models screen**: one tap opens the file list of a
+  curated, ungated GGUF repo (Qwen2.5 1.5B/3B, Llama 3.2 3B, DeepSeek-R1
+  distill 1.5B, SmolLM2 1.7B, Phi-3.5 mini) — no search query needed.
+- **Pre-download RAM fit badges**: every remote GGUF file shows fits / tight /
+  risky, estimated from the file size plus a conservative per-token KV-cache
+  heuristic against currently available RAM, so a 4 GB phone sees "risky" on a
+  3 GB model before spending twenty minutes downloading it.
+- **GitHub Actions CI**: every push to main and every pull request runs the
+  full JVM test suite for both flavors, then builds the proot release APK twice
+  (portable and `armv8.2-a+dotprod` perf variants) in parallel. CI artifacts
+  are debug-signed with an ephemeral key — installable for side-load testing,
+  clearly not release builds; release signing material never leaves the
+  maintainer's machine.
+
+### Changed
+
+- `MemoryGuard` gained a pure, unit-testable size-only estimate path used for
+  remote files (metadata-based estimates for local files are unchanged).
+
 ## 0.2.3 — 2026-10-27
 
 Container quality pass: the shell you talk to now behaves like a real terminal.

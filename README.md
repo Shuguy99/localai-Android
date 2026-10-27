@@ -1,5 +1,7 @@
 # Local AI Agent (Android)
 
+[![CI](https://github.com/Shuguy99/localai-Android/actions/workflows/ci.yml/badge.svg)](https://github.com/Shuguy99/localai-Android/actions/workflows/ci.yml)
+
 An offline-first Android app that runs a GGUF model on-device, discovers and downloads
 models from Hugging Face, and lets the model act as a coding agent inside a PRoot Linux
 container (simulated root, no host root required).
