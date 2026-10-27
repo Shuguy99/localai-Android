@@ -37,6 +37,12 @@ data class ExecResult(
  * nothing escalates to the kernel or touches /system. It works on an unrooted
  * Android 10+ device, but the app must target SDK 28 to be allowed to exec the
  * guest binaries (see the flavor comment in app/build.gradle.kts).
+ *
+ * Command execution uses a persistent shell session (see [ShellSession]): one
+ * PRoot process stays alive across calls, so shell state (cwd, env) survives
+ * between commands and every command after the first skips the 150-300 ms
+ * ptrace startup. The legacy one-shot path is kept as a fallback for hosts
+ * where the session protocol cannot start (e.g. no busybox base64).
  */
 class ContainerManager(private val context: Context) {
 
@@ -49,13 +55,35 @@ class ContainerManager(private val context: Context) {
     val sharedDir: File = File(context.filesDir, "shared").apply { mkdirs() }
     val prootTmpDir: File = File(context.filesDir, "proot-tmp").apply { mkdirs() }
 
+    /**
+     * Host-side apk package cache, bind-mounted over /etc/apk/cache. Downloaded
+     * .apk files survive container resets, so reinstalls after a reset happen
+     * from local storage instead of the network. apk caches automatically when
+     * that directory exists.
+     */
+    val apkCacheDir: File = File(context.filesDir, "apk-cache").apply { mkdirs() }
+
     private val installer = RootfsInstaller(context)
 
     /** Processes currently owned by exec(); Stop in the chat screen kills these. */
     private val activeProcesses = ConcurrentHashMap.newKeySet<Process>()
 
+    // --- persistent session bookkeeping -------------------------------------
+    private val sessionLock = Any()
+    private var session: ShellSession? = null
+    private var sessionSignature: String? = null
+    private var lastSessionUseMs: Long = 0L
+
+    /** Sticky flag: the guest lacks busybox base64, sessions can never work here. */
+    @Volatile private var sessionUnsupported = false
+
     fun cancelActive() {
         activeProcesses.forEach { runCatching { it.destroyForcibly() } }
+        synchronized(sessionLock) {
+            session?.kill()
+            session = null
+            sessionSignature = null
+        }
     }
 
     fun refresh() {
@@ -78,6 +106,7 @@ class ContainerManager(private val context: Context) {
             _state.value = ContainerState.Error(msg)
             return@withContext Result.failure(IllegalStateException(msg))
         }
+        destroySession()
         _state.value = ContainerState.Installing(0f, "Extracting Alpine minirootfs")
         runCatching {
             installer.install(
@@ -91,6 +120,7 @@ class ContainerManager(private val context: Context) {
     }
 
     suspend fun reset() = withContext(Dispatchers.IO) {
+        destroySession()
         alpineRootfs.deleteRecursively()
         snapshotsDir.deleteRecursively()
         snapshotsDir.mkdirs()
@@ -125,72 +155,56 @@ class ContainerManager(private val context: Context) {
 
         val timeout = (timeoutOverrideSeconds ?: settings.timeoutSeconds).coerceIn(2, 600)
         val maxOutput = settings.maxOutputBytes.coerceIn(1024, 1024 * 1024)
+
+        if (!sessionUnsupported) {
+            val reused = obtainSession(proot, settings, workdir)
+            if (reused != null) {
+                try {
+                    val script = ShellProtocol.withMemoryLimit(command, settings.memoryLimitMb)
+                    val result = reused.run(script, timeout, maxOutput)
+                    if (result.timedOut || !reused.isAlive) {
+                        destroySession()
+                        if (!result.timedOut && result.exitCode == -2) {
+                            return@withContext result.copy(
+                                output = result.output +
+                                    "\n[shell session died; state lost — next command starts fresh]",
+                            )
+                        }
+                    }
+                    return@withContext result
+                } catch (_: IllegalStateException) {
+                    // Session died between the liveness check and run(); fall
+                    // through to the one-shot path so the command still runs.
+                    destroySession()
+                }
+            }
+        }
+        execOneShot(command, settings, workdir, timeout, maxOutput, proot, start)
+    }
+
+    /** Legacy path: one PRoot process per command. Kept as the session fallback. */
+    private suspend fun execOneShot(
+        command: String,
+        settings: ContainerSettings,
+        workdir: String,
+        timeout: Int,
+        maxOutput: Int,
+        proot: File,
+        start: Long,
+    ): ExecResult = withContext(Dispatchers.IO) {
         val script = buildString {
             if (settings.memoryLimitMb > 0) {
                 append("ulimit -v ").append(settings.memoryLimitMb * 1024L).append(" 2>/dev/null; ")
             }
             append(command)
         }
-
-        val args = mutableListOf<String>()
-        args += proot.absolutePath
-        args += "--kill-on-exit"
-        args += "--link2symlink"
-        if (settings.simulatedRoot) args += "-0"
-        args += listOf("-r", alpineRootfs.absolutePath)
-        args += listOf("-b", "/dev", "-b", "/proc", "-b", "/sys")
-        args += listOf("-b", "${snapshotsDir.absolutePath}:/snapshots")
-        args += listOf("-b", "${sharedDir.absolutePath}:/shared")
-        if (settings.exposeSharedStorage) {
-            args += listOf("-b", "/storage/emulated/0:/mnt/host")
-        }
-        args += listOf("-w", workdir)
-        args += listOf(
-            "/usr/bin/env", "-i",
-            "HOME=/root",
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "TERM=dumb",
-            "LANG=C.UTF-8",
-            "/bin/sh", "-lc", script,
-        )
-
-        val pb = ProcessBuilder(args).redirectErrorStream(true)
-        fun configureEnvironment(builder: ProcessBuilder): ProcessBuilder {
-            val env = builder.environment()
-            env["PROOT_TMP_DIR"] = prootTmpDir.absolutePath
-            env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
-            if (settings.noSeccomp) env["PROOT_NO_SECCOMP"] = "1"
-            env["HOME"] = context.filesDir.absolutePath
-            return builder
-        }
-        configureEnvironment(pb)
-
-        val process = try {
-            pb.start()
-        } catch (firstFailure: IOException) {
-            // Some OEMs mount nativeLibraryDir noexec; canExecute() may still report
-            // true because access(2) does not always consult mount flags. Retry once
-            // from app-private storage, where the proot flavor (targetSdk 28) may exec.
-            val fallback = copyProotToFiles(proot)
-            if (fallback == null || fallback.absolutePath == proot.absolutePath) {
-                return@withContext ExecResult(
-                    -2, "Failed to start PRoot: ${firstFailure.message}", false, false,
-                    System.currentTimeMillis() - start,
-                )
-            }
-            args[0] = fallback.absolutePath
-            try {
-                val retry = ProcessBuilder(args).redirectErrorStream(true)
-                configureEnvironment(retry)
-                retry.start()
-            } catch (secondFailure: IOException) {
-                return@withContext ExecResult(
-                    -2,
-                    "Failed to start PRoot: ${secondFailure.message}",
-                    false, false,
-                    System.currentTimeMillis() - start,
-                )
-            }
+        val args = buildProotArgs(proot, settings, workdir, script)
+        val (process, startError) = startProot(args, settings)
+        if (process == null) {
+            return@withContext ExecResult(
+                -2, startError ?: "Failed to start PRoot.", false, false,
+                System.currentTimeMillis() - start,
+            )
         }
 
         activeProcesses.add(process)
@@ -248,6 +262,150 @@ class ContainerManager(private val context: Context) {
         }
     }
 
+    // --- session management --------------------------------------------------
+
+    /**
+     * Returns the live session, recreating it when the settings signature
+     * changed, after an idle timeout, or when it died. Workdir is applied only
+     * at session creation: afterwards the guest's own `cd` wins, which is the
+     * point of a persistent shell. null means the session cannot be used and
+     * the caller should fall back to one-shot execution.
+     */
+    private fun obtainSession(proot: File, settings: ContainerSettings, workdir: String): ShellSession? {
+        val signature = sessionSignature(proot, settings, workdir)
+        synchronized(sessionLock) {
+            val existing = session
+            if (existing != null) {
+                val stale = System.currentTimeMillis() - lastSessionUseMs > SESSION_IDLE_MS
+                if (signature != sessionSignature || !existing.isAlive || stale) {
+                    runCatching { existing.shutdown() }
+                    session = null
+                    sessionSignature = null
+                } else {
+                    lastSessionUseMs = System.currentTimeMillis()
+                    return existing
+                }
+            }
+            val fresh = createSession(proot, settings, workdir, signature) ?: return null
+            session = fresh
+            sessionSignature = signature
+            lastSessionUseMs = System.currentTimeMillis()
+            return fresh
+        }
+    }
+
+    private fun createSession(
+        proot: File,
+        settings: ContainerSettings,
+        workdir: String,
+        signature: String,
+    ): ShellSession? {
+        val args = buildProotArgs(proot, settings, workdir, ShellProtocol.SESSION_LOOP)
+        val process = startProot(args, settings).first ?: return null
+        val created = ShellSession(
+            output = process.inputStream,
+            input = process.outputStream,
+            killFn = { runCatching { process.destroyForcibly() } },
+            aliveFn = { process.isAlive },
+        )
+        val healthy = runCatching { created.ping() }.getOrDefault(false)
+        if (!healthy) {
+            if (created.sawUnsupported) sessionUnsupported = true
+            runCatching { created.shutdown() }
+            return null
+        }
+        return created
+    }
+
+    private fun destroySession() {
+        synchronized(sessionLock) {
+            session?.let { runCatching { it.shutdown() } }
+            session = null
+            sessionSignature = null
+        }
+    }
+
+    private fun sessionSignature(proot: File, settings: ContainerSettings, workdir: String): String =
+        listOf(
+            proot.absolutePath,
+            alpineRootfs.absolutePath,
+            settings.simulatedRoot,
+            settings.exposeSharedStorage,
+            settings.noSeccomp,
+            workdir,
+        ).joinToString("|")
+
+    // --- process plumbing ----------------------------------------------------
+
+    /**
+     * PRoot argument list shared by the session and one-shot paths. The last
+     * three elements launch /bin/sh with [shellScript] via -c (the session
+     * loop for persistent sessions, the raw command for one-shot runs).
+     */
+    private fun buildProotArgs(
+        proot: File,
+        settings: ContainerSettings,
+        workdir: String,
+        shellScript: String,
+    ): List<String> = buildList {
+        add(proot.absolutePath)
+        add("--kill-on-exit")
+        add("--link2symlink")
+        if (settings.simulatedRoot) add("-0")
+        addAll(listOf("-r", alpineRootfs.absolutePath))
+        addAll(listOf("-b", "/dev", "-b", "/proc", "-b", "/sys"))
+        addAll(listOf("-b", "${snapshotsDir.absolutePath}:/snapshots"))
+        addAll(listOf("-b", "${sharedDir.absolutePath}:/shared"))
+        addAll(listOf("-b", "${apkCacheDir.absolutePath}:/etc/apk/cache"))
+        if (settings.exposeSharedStorage) {
+            addAll(listOf("-b", "/storage/emulated/0:/mnt/host"))
+        }
+        addAll(listOf("-w", workdir))
+        addAll(
+            listOf(
+                "/usr/bin/env", "-i",
+                "HOME=/root",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "TERM=dumb",
+                "LANG=C.UTF-8",
+                "/bin/sh", "-lc", shellScript,
+            ),
+        )
+    }
+
+    /** Starts PRoot, retrying once from app-private storage on noexec mounts. */
+    private fun startProot(args: List<String>, settings: ContainerSettings): Pair<Process?, String?> {
+        fun configure(builder: ProcessBuilder): ProcessBuilder {
+            val env = builder.environment()
+            env["PROOT_TMP_DIR"] = prootTmpDir.absolutePath
+            env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
+            if (settings.noSeccomp) env["PROOT_NO_SECCOMP"] = "1"
+            env["HOME"] = context.filesDir.absolutePath
+            return builder
+        }
+        val pb = ProcessBuilder(args).redirectErrorStream(true)
+        configure(pb)
+        return try {
+            pb.start() to null
+        } catch (firstFailure: IOException) {
+            // Some OEMs mount nativeLibraryDir noexec; canExecute() may still report
+            // true because access(2) does not always consult mount flags. Retry once
+            // from app-private storage, where the proot flavor (targetSdk 28) may exec.
+            val fallback = copyProotToFiles(File(args[0]))
+            if (fallback == null || fallback.absolutePath == args[0]) {
+                return null to "Failed to start PRoot: ${firstFailure.message}"
+            }
+            val retryArgs = args.toMutableList().also { it[0] = fallback.absolutePath }
+            val retry = ProcessBuilder(retryArgs).redirectErrorStream(true)
+            configure(retry)
+            try {
+                retry.start() to null
+            } catch (secondFailure: IOException) {
+                null to "Failed to start PRoot: ${secondFailure.message}"
+            }
+        }
+    }
+
     /** Cheap existence check safe to call on the main thread from refresh(). */
     private fun prootAvailable(): Boolean =
         File(context.applicationInfo.nativeLibraryDir, "libproot.so").isFile ||
@@ -288,4 +446,9 @@ class ContainerManager(private val context: Context) {
     fun hostArchitectureNote(): String =
         "ABI: ${Build.SUPPORTED_ABIS.firstOrNull() ?: "?"} | " +
             "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+
+    private companion object {
+        /** Sessions idle longer than this are torn down and rebuilt on demand. */
+        const val SESSION_IDLE_MS = 10 * 60 * 1000L
+    }
 }

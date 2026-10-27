@@ -30,7 +30,6 @@ class SnapshotStore(
             val result = container.exec(
                 command = "tar -czf /snapshots/$name -C /workspace . 2>/dev/null",
                 settings = settings,
-                workdir = "/",
                 timeoutOverrideSeconds = 120,
             )
             if (!result.ok) {
@@ -69,7 +68,6 @@ class SnapshotStore(
                     "rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null; " +
                     "tar -xzf /snapshots/$name -C /workspace",
                 settings = settings,
-                workdir = "/",
                 timeoutOverrideSeconds = 120,
             )
             if (result.ok) Result.success(Unit)
