@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.1 — 2026-10-28
+
+Two user-reported fixes: a frozen UI while a model loads, and raw
+`<think>`/```tool markup showing up as literal text in assistant messages.
+
+### Fixed
+
+- **UI no longer freezes while a model loads** ("the Chat button doesn't work
+  until the app is restarted"): the whole load path — `dlopen` of the native
+  runtime, llama.cpp backend init (Vulkan device enumeration included), the
+  GGUF read itself and metadata parsing — now runs on `Dispatchers.Default`.
+  Previously the first load executed backend init and metadata parsing on the
+  main thread, so the navigation bar could stop responding for seconds at a
+  time. `EngineState.Loading` is also published *before* the mutex and backend
+  init, so the busy state appears immediately. The Chat screen shows a
+  "Model is loading…" banner while this happens, and switching tabs stays
+  responsive throughout.
+- **Assistant messages render markup properly**: reasoning (`<think>…</think>`)
+  collapses into a dim, italic "Thinking" section (expanded live while
+  streaming, collapsed once finished), ```tool fences become compact
+  "Tool call: <name>" cards (the raw JSON is one tap away), and ordinary
+  ``` code fences render as monospace blocks with a language label on a dark
+  surface. Parsing is tolerant: unterminated (mid-stream) blocks stream as
+  open segments, unknown markup falls back to plain text, and everything is
+  covered by 19 new unit tests (`AssistantTextTest`).
+- **Stop is no longer a trap**: if a stopped turn fails to unwind (a native
+  call wedged between tokens or a hung container exec), a 5-second watchdog
+  force-releases the UI, restores the input field and posts a notice instead
+  of leaving the chat stuck on the Stop button until a restart.
+
 ## 0.3.0 — 2026-10-27
 
 Conversation persistence, sharded models and a real GPU backend: the three

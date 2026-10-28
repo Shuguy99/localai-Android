@@ -15,6 +15,8 @@ import dev.localai.agent.service.RuntimeForegroundService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,6 +49,7 @@ data class ChatUiState(
     val step: Int = 0,
     val maxSteps: Int = 0,
     val modelReady: Boolean = false,
+    val modelLoading: Boolean = false,
     val modelLabel: String? = null,
     val selectedModelPath: String? = null,
     val settings: AppSettings = AppSettings(),
@@ -77,6 +80,12 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
     @Volatile
     private var pendingConfirm: CompletableDeferred<Boolean>? = null
 
+    /** Fires when a stopped turn fails to unwind; recovers the UI. */
+    private var stopWatchdog: Job? = null
+
+    /** Incremented on every send(); lets the watchdog ignore newer turns. */
+    private var turnCounter = 0L
+
     init {
         viewModelScope.launch {
             app.settings.settings.collect { settings ->
@@ -98,6 +107,7 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
                 _state.update {
                     it.copy(
                         modelReady = ready != null,
+                        modelLoading = engine is EngineState.Loading,
                         modelLabel = ready?.info?.description ?: ready?.info?.path?.substringAfterLast('/'),
                     )
                 }
@@ -144,6 +154,8 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
             )
         }
         activeAssistantId = null
+        stopWatchdog?.cancel()
+        turnCounter++
 
         viewModelScope.launch {
             val listener = object : AgentListener {
@@ -246,6 +258,35 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
         app.runtime.cancel()
         // A command waiting for approval must not block a stopped turn forever.
         resolvePending(false)
+        // If the engine ignores the cancellation (a native call wedged between
+        // tokens, a hung container exec), the UI would stay on the Stop button
+        // with input disabled — the "only a restart helps" class of bugs. The
+        // watchdog force-releases the UI; the runtime remains usable because
+        // generate() serialises on the engine mutex anyway.
+        stopWatchdog?.cancel()
+        val stoppedTurn = turnCounter
+        stopWatchdog = viewModelScope.launch {
+            delay(STOP_WATCHDOG_MS)
+            if (_state.value.generating && turnCounter == stoppedTurn) recoverStuckStop()
+        }
+    }
+
+    private fun recoverStuckStop() {
+        _state.update { s ->
+            s.copy(
+                generating = false,
+                messages = s.messages.map { m -> if (m.streaming) m.copy(streaming = false) else m },
+            )
+        }
+        _state.update {
+            it.copy(
+                messages = it.messages + ChatMessage(
+                    "n-${System.nanoTime()}",
+                    MessageRole.NOTICE,
+                    "Stop requested, but the engine did not respond in time. Chat recovered.",
+                ),
+            )
+        }
     }
 
     fun allowCommand() = resolvePending(true)
@@ -374,5 +415,6 @@ class ChatViewModel(private val app: AppContainer) : ViewModel() {
     private companion object {
         const val SERVICE_KEY = "model:chat"
         const val ChatStoreMaxToolText = 4096
+        const val STOP_WATCHDOG_MS = 5_000L
     }
 }

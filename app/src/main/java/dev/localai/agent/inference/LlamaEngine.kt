@@ -74,45 +74,58 @@ class LlamaEngine {
     private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded)
     val state: StateFlow<EngineState> = _state.asStateFlow()
 
-    suspend fun load(path: String, settings: ModelSettings): Result<ModelInfo> = mutex.withLock {
+    suspend fun load(path: String, settings: ModelSettings): Result<ModelInfo> {
+        // Surface the busy state before anything slow happens: the first load
+        // also dlopens the native runtime and initialises the Vulkan backend,
+        // which can take seconds on some devices. The UI must see Loading now,
+        // not after those steps, and navigation must stay responsive.
+        _state.value = EngineState.Loading
+        return mutex.withLock {
+            // The whole load path (dlopen, backend init, GGUF mmap/read,
+            // metadata parse) runs off the main thread. Callers on Main only
+            // observe the state flow — a slow load can never freeze the UI,
+            // which is what made the Chat tab dead until an app restart.
+            withContext(Dispatchers.Default) { loadLocked(path, settings) }
+        }
+    }
+
+    /** Runs entirely on [Dispatchers.Default]; callers must not be on Main. */
+    private fun loadLocked(path: String, settings: ModelSettings): Result<ModelInfo> {
         LlamaBridge.ensureLoaded()?.let { err ->
             val message = "Native runtime unavailable: $err. Build with scripts/fetch_deps.sh."
             _state.value = EngineState.Error(message)
-            return@withLock Result.failure(IllegalStateException(message))
+            return Result.failure(IllegalStateException(message))
         }
 
         if (handle != 0L) {
-            withContext(Dispatchers.Default) { LlamaBridge.freeModel(handle) }
+            LlamaBridge.freeModel(handle)
             handle = 0L
         }
 
-        _state.value = EngineState.Loading
         val threads = settings.threads.coerceIn(1, Runtime.getRuntime().availableProcessors())
         val ctx = settings.contextSize.coerceIn(512, 32768)
         val batch = minOf(512, ctx)
 
-        val loaded = withContext(Dispatchers.Default) {
-            runCatching {
-                LlamaBridge.loadModel(path, ctx, threads, settings.gpuLayers, batch, settings.kvCacheQ8)
-            }
+        val loaded = runCatching {
+            LlamaBridge.loadModel(path, ctx, threads, settings.gpuLayers, batch, settings.kvCacheQ8)
         }.getOrElse { t ->
             val message = t.message ?: "Model load failed"
             _state.value = EngineState.Error(message)
-            return@withLock Result.failure(t)
+            return Result.failure(t)
         }
 
         if (loaded == 0L) {
             val message = "llama.cpp could not load this GGUF. The file may be corrupt, " +
                 "sharded, or use an unsupported architecture."
             _state.value = EngineState.Error(message)
-            return@withLock Result.failure(IllegalStateException(message))
+            return Result.failure(IllegalStateException(message))
         }
 
         handle = loaded
         val info = runCatching { parseInfo(path, LlamaBridge.modelInfo(loaded)) }.getOrNull()
             ?: ModelInfo(path, path.substringAfterLast('/'), 0, 0, ctx, 0, 0, 0)
         _state.value = EngineState.Ready(info)
-        Result.success(info)
+        return Result.success(info)
     }
 
     suspend fun unload() = mutex.withLock {

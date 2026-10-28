@@ -1,8 +1,12 @@
 package dev.localai.agent.ui.chat
 
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,6 +26,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.AddComment
+import androidx.compose.material.icons.outlined.Build
+import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -37,10 +46,15 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -90,6 +104,9 @@ fun ChatScreen(
             }
         }
 
+        if (state.modelLoading) {
+            LoadingBanner()
+        }
         if (!state.modelReady) {
             NoModelBanner(onOpenModels)
         }
@@ -237,6 +254,30 @@ private fun CommandApprovalCard(
 }
 
 @Composable
+private fun LoadingBanner() {
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            Spacer(Modifier.width(10.dp))
+            Text(
+                "Model is loading — large GGUFs can take a while. " +
+                    "You can switch tabs freely; chat unlocks automatically.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
 private fun NoModelBanner(onOpenModels: () -> Unit) {
     Surface(
         color = MaterialTheme.colorScheme.primaryContainer,
@@ -283,6 +324,10 @@ private fun EmptyChatHint(modelReady: Boolean, onOpenModels: () -> Unit) {
     }
 }
 
+private val CodeSurface = Color(0xFF14161A)
+private val CodeForeground = Color(0xFFE4E7EC)
+private val CodeMuted = Color(0xFF9AA3AF)
+
 @Composable
 private fun UserBubble(message: ChatMessage) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -301,22 +346,202 @@ private fun UserBubble(message: ChatMessage) {
     }
 }
 
+/**
+ * Renders an assistant message as parsed segments: prose, collapsible thinking,
+ * monospace code blocks and compact tool-call cards — instead of the raw
+ * `<think>`/``` markup.
+ */
 @Composable
 private fun AssistantBubble(message: ChatMessage) {
+    val segments = remember(message.text) { AssistantText.parse(message.text) }
     Surface(
         color = MaterialTheme.colorScheme.surface,
         shape = RoundedCornerShape(4.dp, 16.dp, 16.dp, 16.dp),
         modifier = Modifier.fillMaxWidth(0.94f),
     ) {
-        Column(Modifier.padding(12.dp)) {
-            Text(
-                message.text + if (message.streaming) " ▍" else "",
-                style = MaterialTheme.typography.bodyLarge,
-            )
+        Column(
+            Modifier
+                .padding(12.dp)
+                .animateContentSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (segments.isEmpty()) {
+                if (message.streaming) {
+                    Text("▍", style = MaterialTheme.typography.bodyLarge)
+                }
+            } else {
+                segments.forEachIndexed { index, segment ->
+                    // The blinking caret belongs to the very last segment only.
+                    AssistantSegmentView(segment, cursor = message.streaming && index == segments.lastIndex)
+                }
+            }
             if (message.streaming) {
-                Spacer(Modifier.height(6.dp))
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun AssistantSegmentView(segment: AssistantSegment, cursor: Boolean) {
+    when (segment) {
+        is AssistantSegment.Text -> Text(
+            segment.text + if (cursor) " ▍" else "",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        is AssistantSegment.Thinking -> ThinkingSection(segment, cursor)
+        is AssistantSegment.Code -> CodeBlock(segment, cursor)
+        is AssistantSegment.ToolCall -> ToolCallCard(segment)
+    }
+}
+
+@Composable
+private fun ThinkingSection(segment: AssistantSegment.Thinking, cursor: Boolean) {
+    // Live thinking starts expanded; once the block closes it collapses so the
+    // answer itself takes the spotlight. The user can always re-open it.
+    var expanded by remember(segment.open) { mutableStateOf(segment.open) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded },
+        ) {
+            Icon(
+                Icons.Outlined.Psychology,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (segment.open) "Thinking…" else "Thinking",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            Icon(
+                if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                contentDescription = if (expanded) "Collapse thinking" else "Expand thinking",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+        if (expanded) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                segment.text.ifBlank { "…" } + if (cursor) " ▍" else "",
+                style = MaterialTheme.typography.bodySmall,
+                fontStyle = FontStyle.Italic,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CodeBlock(segment: AssistantSegment.Code, cursor: Boolean) {
+    Surface(
+        color = CodeSurface,
+        contentColor = CodeForeground,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 10.dp, end = 10.dp, top = 6.dp),
+            ) {
+                Text(
+                    segment.language.ifBlank { "code" },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = CodeMuted,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    Icons.Outlined.Code,
+                    contentDescription = null,
+                    tint = CodeMuted,
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+            Text(
+                segment.text + if (cursor) "▍" else "",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(10.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ToolCallCard(segment: AssistantSegment.ToolCall) {
+    // Collapsed by default: the execution itself already shows up as a
+    // dedicated tool bubble below; this card is just the model's intent.
+    var expanded by remember(segment.open) { mutableStateOf(false) }
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+        ) {
+            Icon(
+                Icons.Outlined.Build,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (segment.open) {
+                    "Calling ${segment.name ?: "tool"}…"
+                } else {
+                    segment.name?.let { "Tool call: $it" } ?: "Tool call"
+                },
+                style = MaterialTheme.typography.labelMedium,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.weight(1f),
+            )
+            if (segment.open) {
+                CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Icon(
+                if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                contentDescription = if (expanded) "Collapse tool call" else "Expand tool call",
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+        if (expanded) {
+            Text(
+                segment.json.ifBlank { "(no arguments yet)" },
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(start = 10.dp, end = 10.dp, bottom = 8.dp),
+            )
         }
     }
 }
